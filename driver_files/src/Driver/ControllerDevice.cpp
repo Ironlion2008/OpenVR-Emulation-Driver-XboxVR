@@ -75,7 +75,7 @@ bool InitializeXInput()
         std::ostringstream message;
         message << "[XboxVR][XINPUT] Failed to load xinput1_4.dll, error="
                 << GetLastError();
-        GetDriver()->Log(message.str());
+        OpenVREmulatorDriver::GetDriver()->Log(message.str());
         return false;
     }
 
@@ -91,7 +91,7 @@ bool InitializeXInput()
         std::ostringstream message;
         message << "[XboxVR][XINPUT] Failed to resolve XInput functions, error="
                 << GetLastError();
-        GetDriver()->Log(message.str());
+        OpenVREmulatorDriver::GetDriver()->Log(message.str());
 
         FreeLibrary(gXInputModule);
         gXInputModule = nullptr;
@@ -103,9 +103,9 @@ bool InitializeXInput()
     char modulePath[MAX_PATH] = {};
     GetModuleFileNameA(gXInputModule, modulePath, MAX_PATH);
 
-    GetDriver()->Log(
+    OpenVREmulatorDriver::GetDriver()->Log(
         std::string("[XboxVR][XINPUT] Loaded xinput1_4.dll: ") + modulePath);
-    GetDriver()->Log(
+    OpenVREmulatorDriver::GetDriver()->Log(
         "[XboxVR][XINPUT] XInputGetState/XInputSetState resolved successfully");
 
     return true;
@@ -149,7 +149,7 @@ XInputSnapshot ReadFirstConnectedXInput()
 
     if (!InitializeXInput())
     {
-        GetDriver()->Log("[XboxVR][S4] XInput 1.4 initialization failed");
+        OpenVREmulatorDriver::GetDriver()->Log("[XboxVR][S4] XInput 1.4 initialization failed");
         return snapshot;
     }
 
@@ -270,10 +270,10 @@ void ControllerDevice::Update()
         return;
     }
 
-    const float deltaSeconds = static_cast<float>(GetDriver()->GetLastFrameTime().count()) /
+    const float deltaSeconds = static_cast<float>(OpenVREmulatorDriver::GetDriver()->GetLastFrameTime().count()) /
                                kMillisecondsPerSecond;
 
-    const auto events = GetDriver()->GetOpenVREvents();
+    const auto events = OpenVREmulatorDriver::GetDriver()->GetOpenVREvents();
     for (const auto &event : events)
     {
         if (event.eventType != vr::EVREventType::VREvent_Input_HapticVibration ||
@@ -339,8 +339,8 @@ void ControllerDevice::Update()
             diagnostic << " | NO XINPUT CONTROLLER";
         }
 
-        GetDriver()->Log(diagnostic.str());
-        GetDriver()->Log(std::string("[XboxVR][S5] XInput state ") +
+        OpenVREmulatorDriver::GetDriver()->Log(diagnostic.str());
+        OpenVREmulatorDriver::GetDriver()->Log(std::string("[XboxVR][S5] XInput state ") +
                          (snapshot.connected ? "accepted from connected controller"
                                               : "not available; using neutral input values"));
     }
@@ -352,7 +352,7 @@ void ControllerDevice::Update()
     auto pose = IVRDevice::MakeDefaultPose();
 
     // Controllers follow the HMD pose and sit slightly below/aside it.
-    const auto devices = GetDriver()->GetDevices();
+    const auto devices = OpenVREmulatorDriver::GetDriver()->GetDevices();
     IVRDevice *hmdDevice = nullptr;
     for (const auto &device : devices)
     {
@@ -429,7 +429,7 @@ void ControllerDevice::Update()
                << " joystickY=" << joystickY
                << " trigger=" << triggerValue
                << " triggerClick=" << (triggerValue >= triggerClickThreshold ? 1 : 0);
-        GetDriver()->Log(values.str());
+        OpenVREmulatorDriver::GetDriver()->Log(values.str());
     }
 
     const WORD dpadHorizontalMask = XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_DPAD_RIGHT;
@@ -453,11 +453,11 @@ void ControllerDevice::Update()
 
     auto updateButton = [this](vr::VRInputComponentHandle_t click,
                                vr::VRInputComponentHandle_t touch, bool pressed) {
-        GetDriver()->GetInput()->UpdateBooleanComponent(click, pressed, 0);
-        GetDriver()->GetInput()->UpdateBooleanComponent(touch, pressed, 0);
+        OpenVREmulatorDriver::GetDriver()->GetInput()->UpdateBooleanComponent(click, pressed, 0);
+        OpenVREmulatorDriver::GetDriver()->GetInput()->UpdateBooleanComponent(touch, pressed, 0);
     };
     auto updateScalar = [this](vr::VRInputComponentHandle_t component, float value) {
-        GetDriver()->GetInput()->UpdateScalarComponent(component, value, 0);
+        OpenVREmulatorDriver::GetDriver()->GetInput()->UpdateScalarComponent(component, value, 0);
     };
 
     updateButton(this->a_button_click_component_, this->a_button_touch_component_, aPressed);
@@ -465,13 +465,13 @@ void ControllerDevice::Update()
     updateButton(this->x_button_click_component_, this->x_button_touch_component_, xPressed);
     updateButton(this->y_button_click_component_, this->y_button_touch_component_, yPressed);
 
-    GetDriver()->GetInput()->UpdateBooleanComponent(
+    OpenVREmulatorDriver::GetDriver()->GetInput()->UpdateBooleanComponent(
         this->trigger_click_component_, triggerValue >= triggerClickThreshold, 0);
-    GetDriver()->GetInput()->UpdateBooleanComponent(
+    OpenVREmulatorDriver::GetDriver()->GetInput()->UpdateBooleanComponent(
         this->trigger_touch_component_, triggerValue > 0.0f, 0);
     updateScalar(this->trigger_value_component_, triggerValue);
 
-    GetDriver()->GetInput()->UpdateBooleanComponent(
+    OpenVREmulatorDriver::GetDriver()->GetInput()->UpdateBooleanComponent(
         this->grip_touch_component_, gripPressed, 0);
     updateScalar(this->grip_value_component_, gripPressed ? 1.0f : 0.0f);
     updateScalar(this->grip_force_component_, gripPressed ? 1.0f : 0.0f);
@@ -482,9 +482,9 @@ void ControllerDevice::Update()
     updateScalar(this->trackpad_x_component_, trackpadX);
     updateScalar(this->trackpad_y_component_, trackpadY);
 
-    GetDriver()->GetInput()->UpdateBooleanComponent(
+    OpenVREmulatorDriver::GetDriver()->GetInput()->UpdateBooleanComponent(
         this->joystick_click_component_, joystickClick, 0);
-    GetDriver()->GetInput()->UpdateBooleanComponent(
+    OpenVREmulatorDriver::GetDriver()->GetInput()->UpdateBooleanComponent(
         this->joystick_touch_component_,
         joystickClick || std::abs(joystickX) > kJoystickTouchThreshold ||
             std::abs(joystickY) > kJoystickTouchThreshold, 0);
@@ -494,14 +494,14 @@ void ControllerDevice::Update()
     if (gXInputDiagnostic.has_logged_once &&
         diagnosticNow - gXInputDiagnostic.last_log_time < std::chrono::milliseconds(50))
     {
-        GetDriver()->Log(std::string("[XboxVR][S7] ") +
+        OpenVREmulatorDriver::GetDriver()->Log(std::string("[XboxVR][S7] ") +
                          (this->handedness_ == Handedness::LEFT ? "LEFT" : "RIGHT") +
                          " OpenVR input components updated");
     }
 
     ApplyXInputRumble(snapshot);
 
-    GetDriver()->GetDriverHost()->TrackedDevicePoseUpdated(this->device_index_, pose,
+    OpenVREmulatorDriver::GetDriver()->GetDriverHost()->TrackedDevicePoseUpdated(this->device_index_, pose,
                                                             sizeof(vr::DriverPose_t));
     this->last_pose_ = pose;
 }
@@ -520,86 +520,86 @@ vr::EVRInitError ControllerDevice::Activate(uint32_t unObjectId)
 {
     this->device_index_ = unObjectId;
 
-    GetDriver()->Log("[XboxVR][S3] Activating Xbox/XInput controller " + this->serial_);
+    OpenVREmulatorDriver::GetDriver()->Log("[XboxVR][S3] Activating Xbox/XInput controller " + this->serial_);
 
     if (InitializeXInput())
     {
-        GetDriver()->Log("[XboxVR][S3] Explicit xinput1_4.dll initialization SUCCESS");
+        OpenVREmulatorDriver::GetDriver()->Log("[XboxVR][S3] Explicit xinput1_4.dll initialization SUCCESS");
     }
     else
     {
-        GetDriver()->Log("[XboxVR][S3] Explicit xinput1_4.dll initialization FAILED");
+        OpenVREmulatorDriver::GetDriver()->Log("[XboxVR][S3] Explicit xinput1_4.dll initialization FAILED");
     }
 
     const auto props =
-        GetDriver()->GetProperties()->TrackedDeviceToPropertyContainer(this->device_index_);
+        OpenVREmulatorDriver::GetDriver()->GetProperties()->TrackedDeviceToPropertyContainer(this->device_index_);
 
-    GetDriver()->GetInput()->CreateHapticComponent(props, "/output/haptic", &this->haptic_component_);
+    OpenVREmulatorDriver::GetDriver()->GetInput()->CreateHapticComponent(props, "/output/haptic", &this->haptic_component_);
 
-    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/a/click",
+    OpenVREmulatorDriver::GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/a/click",
                                                     &this->a_button_click_component_);
-    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/a/touch",
+    OpenVREmulatorDriver::GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/a/touch",
                                                     &this->a_button_touch_component_);
-    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/b/click",
+    OpenVREmulatorDriver::GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/b/click",
                                                     &this->b_button_click_component_);
-    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/b/touch",
+    OpenVREmulatorDriver::GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/b/touch",
                                                     &this->b_button_touch_component_);
-    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/x/click",
+    OpenVREmulatorDriver::GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/x/click",
                                                     &this->x_button_click_component_);
-    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/x/touch",
+    OpenVREmulatorDriver::GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/x/touch",
                                                     &this->x_button_touch_component_);
-    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/y/click",
+    OpenVREmulatorDriver::GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/y/click",
                                                     &this->y_button_click_component_);
-    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/y/touch",
+    OpenVREmulatorDriver::GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/y/touch",
                                                     &this->y_button_touch_component_);
 
-    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/trigger/click",
+    OpenVREmulatorDriver::GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/trigger/click",
                                                     &this->trigger_click_component_);
-    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/trigger/touch",
+    OpenVREmulatorDriver::GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/trigger/touch",
                                                     &this->trigger_touch_component_);
-    GetDriver()->GetInput()->CreateScalarComponent(
+    OpenVREmulatorDriver::GetDriver()->GetInput()->CreateScalarComponent(
         props, "/input/trigger/value", &this->trigger_value_component_,
         vr::EVRScalarType::VRScalarType_Absolute,
         vr::EVRScalarUnits::VRScalarUnits_NormalizedOneSided);
 
-    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/grip/touch",
+    OpenVREmulatorDriver::GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/grip/touch",
                                                     &this->grip_touch_component_);
-    GetDriver()->GetInput()->CreateScalarComponent(
+    OpenVREmulatorDriver::GetDriver()->GetInput()->CreateScalarComponent(
         props, "/input/grip/value", &this->grip_value_component_,
         vr::EVRScalarType::VRScalarType_Absolute,
         vr::EVRScalarUnits::VRScalarUnits_NormalizedOneSided);
-    GetDriver()->GetInput()->CreateScalarComponent(
+    OpenVREmulatorDriver::GetDriver()->GetInput()->CreateScalarComponent(
         props, "/input/grip/force", &this->grip_force_component_,
         vr::EVRScalarType::VRScalarType_Absolute,
         vr::EVRScalarUnits::VRScalarUnits_NormalizedOneSided);
 
-    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/system/click",
+    OpenVREmulatorDriver::GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/system/click",
                                                     &this->system_click_component_);
-    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/system/touch",
+    OpenVREmulatorDriver::GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/system/touch",
                                                     &this->system_touch_component_);
 
-    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/trackpad/click",
+    OpenVREmulatorDriver::GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/trackpad/click",
                                                     &this->trackpad_click_component_);
-    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/trackpad/touch",
+    OpenVREmulatorDriver::GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/trackpad/touch",
                                                     &this->trackpad_touch_component_);
-    GetDriver()->GetInput()->CreateScalarComponent(
+    OpenVREmulatorDriver::GetDriver()->GetInput()->CreateScalarComponent(
         props, "/input/trackpad/x", &this->trackpad_x_component_,
         vr::EVRScalarType::VRScalarType_Absolute,
         vr::EVRScalarUnits::VRScalarUnits_NormalizedTwoSided);
-    GetDriver()->GetInput()->CreateScalarComponent(
+    OpenVREmulatorDriver::GetDriver()->GetInput()->CreateScalarComponent(
         props, "/input/trackpad/y", &this->trackpad_y_component_,
         vr::EVRScalarType::VRScalarType_Absolute,
         vr::EVRScalarUnits::VRScalarUnits_NormalizedTwoSided);
 
-    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/joystick/click",
+    OpenVREmulatorDriver::GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/joystick/click",
                                                     &this->joystick_click_component_);
-    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/joystick/touch",
+    OpenVREmulatorDriver::GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/joystick/touch",
                                                     &this->joystick_touch_component_);
-    GetDriver()->GetInput()->CreateScalarComponent(
+    OpenVREmulatorDriver::GetDriver()->GetInput()->CreateScalarComponent(
         props, "/input/joystick/x", &this->joystick_x_component_,
         vr::EVRScalarType::VRScalarType_Absolute,
         vr::EVRScalarUnits::VRScalarUnits_NormalizedTwoSided);
-    GetDriver()->GetInput()->CreateScalarComponent(
+    OpenVREmulatorDriver::GetDriver()->GetInput()->CreateScalarComponent(
         props, "/input/joystick/y", &this->joystick_y_component_,
         vr::EVRScalarType::VRScalarType_Absolute,
         vr::EVRScalarUnits::VRScalarUnits_NormalizedTwoSided);
@@ -610,28 +610,28 @@ vr::EVRInitError ControllerDevice::Activate(uint32_t unObjectId)
                << " input components created: joystick=(" << this->joystick_x_component_
                << "," << this->joystick_y_component_ << ") trigger="
                << this->trigger_value_component_ << " grip=" << this->grip_value_component_;
-    GetDriver()->Log(activation.str());
+    OpenVREmulatorDriver::GetDriver()->Log(activation.str());
 
-    GetDriver()->GetProperties()->SetUint64Property(props, vr::Prop_CurrentUniverseId_Uint64, 2);
-    GetDriver()->GetProperties()->SetStringProperty(props, vr::Prop_ModelNumber_String,
+    OpenVREmulatorDriver::GetDriver()->GetProperties()->SetUint64Property(props, vr::Prop_CurrentUniverseId_Uint64, 2);
+    OpenVREmulatorDriver::GetDriver()->GetProperties()->SetStringProperty(props, vr::Prop_ModelNumber_String,
                                                     "openvr-emulator_controller");
 
     const std::string renderModelName =
         this->handedness_ == Handedness::LEFT ? "oculus_quest_plus_controller_left"
                                               : "oculus_quest_plus_controller_right";
-    GetDriver()->GetProperties()->SetStringProperty(props, vr::Prop_RenderModelName_String,
+    OpenVREmulatorDriver::GetDriver()->GetProperties()->SetStringProperty(props, vr::Prop_RenderModelName_String,
                                                     renderModelName.c_str());
 
     const auto role = this->handedness_ == Handedness::LEFT
                           ? vr::ETrackedControllerRole::TrackedControllerRole_LeftHand
                           : vr::ETrackedControllerRole::TrackedControllerRole_RightHand;
-    GetDriver()->GetProperties()->SetInt32Property(props, vr::Prop_ControllerRoleHint_Int32, role);
+    OpenVREmulatorDriver::GetDriver()->GetProperties()->SetInt32Property(props, vr::Prop_ControllerRoleHint_Int32, role);
 
     // Keep the source project's stable custom controller type and compatibility profile.
     // This first Xbox pass intentionally avoids experimental remapping/legacy JSON changes.
-    GetDriver()->GetProperties()->SetStringProperty(
+    OpenVREmulatorDriver::GetDriver()->GetProperties()->SetStringProperty(
         props, vr::Prop_ControllerType_String, "openvr-emulator_controller");
-    GetDriver()->GetProperties()->SetStringProperty(
+    OpenVREmulatorDriver::GetDriver()->GetProperties()->SetStringProperty(
         props, vr::Prop_InputProfilePath_String,
         "{openvr-emulator}/input/openvr-emulator_controller_bindings.json");
 
@@ -639,28 +639,28 @@ vr::EVRInitError ControllerDevice::Activate(uint32_t unObjectId)
         this->handedness_ == Handedness::LEFT ? "left" : "right";
     const std::string readyIcon = "{openvr-emulator}/icons/controller_ready_" + handedness + ".png";
     const std::string notReadyIcon = "{openvr-emulator}/icons/controller_not_ready_" + handedness + ".png";
-    GetDriver()->GetProperties()->SetStringProperty(props,
+    OpenVREmulatorDriver::GetDriver()->GetProperties()->SetStringProperty(props,
                                                     vr::Prop_NamedIconPathDeviceReady_String,
                                                     readyIcon.c_str());
-    GetDriver()->GetProperties()->SetStringProperty(props,
+    OpenVREmulatorDriver::GetDriver()->GetProperties()->SetStringProperty(props,
                                                     vr::Prop_NamedIconPathDeviceOff_String,
                                                     notReadyIcon.c_str());
-    GetDriver()->GetProperties()->SetStringProperty(props,
+    OpenVREmulatorDriver::GetDriver()->GetProperties()->SetStringProperty(props,
                                                     vr::Prop_NamedIconPathDeviceSearching_String,
                                                     notReadyIcon.c_str());
-    GetDriver()->GetProperties()->SetStringProperty(props,
+    OpenVREmulatorDriver::GetDriver()->GetProperties()->SetStringProperty(props,
                                                     vr::Prop_NamedIconPathDeviceSearchingAlert_String,
                                                     notReadyIcon.c_str());
-    GetDriver()->GetProperties()->SetStringProperty(props,
+    OpenVREmulatorDriver::GetDriver()->GetProperties()->SetStringProperty(props,
                                                     vr::Prop_NamedIconPathDeviceReadyAlert_String,
                                                     readyIcon.c_str());
-    GetDriver()->GetProperties()->SetStringProperty(props,
+    OpenVREmulatorDriver::GetDriver()->GetProperties()->SetStringProperty(props,
                                                     vr::Prop_NamedIconPathDeviceNotReady_String,
                                                     notReadyIcon.c_str());
-    GetDriver()->GetProperties()->SetStringProperty(props,
+    OpenVREmulatorDriver::GetDriver()->GetProperties()->SetStringProperty(props,
                                                     vr::Prop_NamedIconPathDeviceStandby_String,
                                                     notReadyIcon.c_str());
-    GetDriver()->GetProperties()->SetStringProperty(props,
+    OpenVREmulatorDriver::GetDriver()->GetProperties()->SetStringProperty(props,
                                                     vr::Prop_NamedIconPathDeviceAlertLow_String,
                                                     notReadyIcon.c_str());
 
