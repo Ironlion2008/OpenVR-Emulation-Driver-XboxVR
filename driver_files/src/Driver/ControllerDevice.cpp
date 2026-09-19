@@ -68,14 +68,6 @@ const char *XInputStatusName(DWORD status) noexcept
             return "ERROR_SUCCESS";
         case ERROR_DEVICE_NOT_CONNECTED:
             return "ERROR_DEVICE_NOT_CONNECTED";
-        case ERROR_DEVICE_NOT_FOUND:
-            return "ERROR_DEVICE_NOT_FOUND";
-        case ERROR_INVALID_FUNCTION:
-            return "ERROR_INVALID_FUNCTION";
-        case ERROR_ACCESS_DENIED:
-            return "ERROR_ACCESS_DENIED";
-        case ERROR_BUSY:
-            return "ERROR_BUSY";
         default:
             return "OTHER_ERROR";
     }
