@@ -212,7 +212,7 @@ std::string GetDriverRootPath()
     GetModuleFileNameA(module, buffer.data(), static_cast<DWORD>(buffer.size()));
 
     std::string path(buffer.data());
-    for (int i = 0; i < 2; ++i)
+    for (int i = 0; i < 3; ++i)
     {
         const auto separator = path.find_last_of("\\/");
         if (separator == std::string::npos)

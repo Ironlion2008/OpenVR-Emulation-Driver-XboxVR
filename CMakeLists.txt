@@ -78,8 +78,7 @@ target_include_directories("${DRIVER_PROJECT}" SYSTEM PRIVATE
     "${OPENVR_INCLUDE_DIR}")
 
 target_link_libraries("${DRIVER_PROJECT}" PRIVATE
-    "${OPENVR_LIB}"
-    xinput)
+    "${OPENVR_LIB}")
 
 target_compile_features("${DRIVER_PROJECT}" PRIVATE cxx_std_17)
 

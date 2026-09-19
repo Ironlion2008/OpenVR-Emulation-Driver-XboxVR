@@ -1,789 +1,696 @@
-#include "ControllerDevice.h"
+#include "ControllerDevice.hpp"
 
 #include <Windows.h>
+#include <DirectXMath.h>
 #include <Xinput.h>
 
-#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
-#include <string>
+#include <sstream>
+#include <utility>
 
-#pragma comment(lib, "user32.lib")
+#include "InputMath.hpp"
+
+using namespace DirectX;
 
 namespace
 {
-    // -------------------------------------------------------------------------
-    // Explicit XInput 1.4 loading
-    // -------------------------------------------------------------------------
+using OpenVREmulatorDriver::Clamp01;
+using OpenVREmulatorDriver::NormalizeThumbAxis;
+using OpenVREmulatorDriver::NormalizeTrigger;
 
-    using XInputGetStateFn =
-        DWORD(WINAPI*)(DWORD dwUserIndex, XINPUT_STATE* pState);
+constexpr float kMillisecondsPerSecond = 1000.0f;
+constexpr float kMinHapticDurationSeconds = 0.02f;
+constexpr float kMaxMotorSpeed = 65535.0f;
+constexpr float kJoystickTouchThreshold = 0.1f;
+constexpr float kTrackpadDigitalValue = 1.0f;
+constexpr float kVibrateYOffset = -0.2f;
+constexpr float kVibrateAmplitude = 0.01f;
+constexpr float kVibrateFrequency = 8.0f;
+constexpr float kControllerXOffset = 0.2f;
+constexpr float kControllerZOffset = -0.5f;
+constexpr float kPi = 3.14159265358979323846f;
 
-    HMODULE g_xinputModule = nullptr;
-    XInputGetStateFn g_xinputGetState = nullptr;
-    bool g_xinputInitialized = false;
+struct XInputSnapshot
+{
+    bool connected = false;
+    DWORD user_index = 0;
+    XINPUT_STATE state{};
+    std::array<DWORD, XUSER_MAX_COUNT> slot_status{};
+};
 
-    bool InitializeXInput()
+struct XInputDiagnosticState
+{
+    std::chrono::steady_clock::time_point last_log_time{};
+    bool has_logged_once = false;
+};
+
+XInputDiagnosticState gXInputDiagnostic;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+// SteamVR loads the driver inside vrserver.exe. Do not rely on the MSVC
+// XInput import library because the resolved XInput DLL can differ between
+// environments. Explicitly load the same system XInput 1.4 API that our
+// standalone controller test uses.
+using XInputGetStateFn = DWORD(WINAPI *)(DWORD, XINPUT_STATE *);
+using XInputSetStateFn = DWORD(WINAPI *)(DWORD, XINPUT_VIBRATION *);
+
+HMODULE gXInputModule = nullptr;
+XInputGetStateFn gXInputGetState = nullptr;
+XInputSetStateFn gXInputSetState = nullptr;
+bool gXInputInitialized = false;
+
+bool InitializeXInput()
+{
+    if (gXInputInitialized)
     {
-        if (g_xinputInitialized)
-            return g_xinputGetState != nullptr;
-
-        g_xinputInitialized = true;
-
-        g_xinputModule = LoadLibraryW(L"xinput1_4.dll");
-
-        if (!g_xinputModule)
-        {
-            const DWORD error = GetLastError();
-
-            char buffer[256];
-            snprintf(
-                buffer,
-                sizeof(buffer),
-                "[XboxVR][XINPUT] Failed to load xinput1_4.dll, error=%lu\n",
-                static_cast<unsigned long>(error));
-
-            vr::VRDriverLog()->Log(buffer);
-            return false;
-        }
-
-        g_xinputGetState =
-            reinterpret_cast<XInputGetStateFn>(
-                GetProcAddress(g_xinputModule, "XInputGetState"));
-
-        if (!g_xinputGetState)
-        {
-            const DWORD error = GetLastError();
-
-            char buffer[256];
-            snprintf(
-                buffer,
-                sizeof(buffer),
-                "[XboxVR][XINPUT] XInputGetState not found, error=%lu\n",
-                static_cast<unsigned long>(error));
-
-            vr::VRDriverLog()->Log(buffer);
-
-            FreeLibrary(g_xinputModule);
-            g_xinputModule = nullptr;
-
-            return false;
-        }
-
-        wchar_t modulePath[MAX_PATH] = {};
-        GetModuleFileNameW(
-            g_xinputModule,
-            modulePath,
-            MAX_PATH);
-
-        char narrowPath[MAX_PATH] = {};
-
-        WideCharToMultiByte(
-            CP_UTF8,
-            0,
-            modulePath,
-            -1,
-            narrowPath,
-            MAX_PATH,
-            nullptr,
-            nullptr);
-
-        char buffer[512];
-
-        snprintf(
-            buffer,
-            sizeof(buffer),
-            "[XboxVR][XINPUT] Loaded xinput1_4.dll: %s\n",
-            narrowPath);
-
-        vr::VRDriverLog()->Log(buffer);
-
-        return true;
+        return gXInputGetState != nullptr && gXInputSetState != nullptr;
     }
 
-    // -------------------------------------------------------------------------
-    // XInput state
-    // -------------------------------------------------------------------------
+    gXInputInitialized = true;
+    gXInputModule = LoadLibraryW(L"xinput1_4.dll");
 
-    bool ReadFirstConnectedXInput(XINPUT_STATE& state)
+    if (gXInputModule == nullptr)
     {
-        if (!InitializeXInput())
-        {
-            vr::VRDriverLog()->Log(
-                "[XboxVR][XINPUT] XInput initialization failed\n");
-
-            ZeroMemory(&state, sizeof(state));
-            return false;
-        }
-
-        for (DWORD userIndex = 0; userIndex < XUSER_MAX_COUNT; ++userIndex)
-        {
-            ZeroMemory(&state, sizeof(state));
-
-            const DWORD result =
-                g_xinputGetState(userIndex, &state);
-
-            if (result == ERROR_SUCCESS)
-            {
-                char buffer[512];
-
-                snprintf(
-                    buffer,
-                    sizeof(buffer),
-                    "[XboxVR][S4] XInput connected: slot=%lu buttons=%u LX=%d LY=%d RX=%d RY=%d LT=%u RT=%u\n",
-                    static_cast<unsigned long>(userIndex),
-                    static_cast<unsigned int>(state.Gamepad.wButtons),
-                    static_cast<int>(state.Gamepad.sThumbLX),
-                    static_cast<int>(state.Gamepad.sThumbLY),
-                    static_cast<int>(state.Gamepad.sThumbRX),
-                    static_cast<int>(state.Gamepad.sThumbRY),
-                    static_cast<unsigned int>(state.Gamepad.bLeftTrigger),
-                    static_cast<unsigned int>(state.Gamepad.bRightTrigger));
-
-                vr::VRDriverLog()->Log(buffer);
-
-                return true;
-            }
-
-            if (result == ERROR_DEVICE_NOT_CONNECTED)
-            {
-                char buffer[256];
-
-                snprintf(
-                    buffer,
-                    sizeof(buffer),
-                    "[XboxVR][S4] XInput slot %lu: ERROR_DEVICE_NOT_CONNECTED\n",
-                    static_cast<unsigned long>(userIndex));
-
-                vr::VRDriverLog()->Log(buffer);
-
-                continue;
-            }
-
-            char buffer[256];
-
-            snprintf(
-                buffer,
-                sizeof(buffer),
-                "[XboxVR][S4] XInput slot %lu: error=%lu\n",
-                static_cast<unsigned long>(userIndex),
-                static_cast<unsigned long>(result));
-
-            vr::VRDriverLog()->Log(buffer);
-        }
-
-        ZeroMemory(&state, sizeof(state));
-
-        vr::VRDriverLog()->Log(
-            "[XboxVR][S4] NO XINPUT CONTROLLER\n");
-
+        std::ostringstream message;
+        message << "[XboxVR][XINPUT] Failed to load xinput1_4.dll, error="
+                << GetLastError();
+        GetDriver()->Log(message.str());
         return false;
     }
 
-    // -------------------------------------------------------------------------
-    // Utility functions
-    // -------------------------------------------------------------------------
+    gXInputGetState =
+        reinterpret_cast<XInputGetStateFn>(
+            GetProcAddress(gXInputModule, "XInputGetState"));
+    gXInputSetState =
+        reinterpret_cast<XInputSetStateFn>(
+            GetProcAddress(gXInputModule, "XInputSetState"));
 
-    float NormalizeStick(short value)
+    if (gXInputGetState == nullptr || gXInputSetState == nullptr)
     {
-        constexpr float maxPositive = 32767.0f;
-        constexpr float maxNegative = 32768.0f;
+        std::ostringstream message;
+        message << "[XboxVR][XINPUT] Failed to resolve XInput functions, error="
+                << GetLastError();
+        GetDriver()->Log(message.str());
 
-        if (value >= 0)
-            return static_cast<float>(value) / maxPositive;
-
-        return static_cast<float>(value) / maxNegative;
+        FreeLibrary(gXInputModule);
+        gXInputModule = nullptr;
+        gXInputGetState = nullptr;
+        gXInputSetState = nullptr;
+        return false;
     }
 
-    float NormalizeTrigger(BYTE value)
+    char modulePath[MAX_PATH] = {};
+    GetModuleFileNameA(gXInputModule, modulePath, MAX_PATH);
+
+    GetDriver()->Log(
+        std::string("[XboxVR][XINPUT] Loaded xinput1_4.dll: ") + modulePath);
+    GetDriver()->Log(
+        "[XboxVR][XINPUT] XInputGetState/XInputSetState resolved successfully");
+
+    return true;
+}
+
+struct SharedXInputRumbleState
+{
+    float left_motor = 0.0f;
+    float right_motor = 0.0f;
+    DWORD user_index = 0;
+    bool has_user = false;
+    std::chrono::steady_clock::time_point left_motor_end_time{};
+    std::chrono::steady_clock::time_point right_motor_end_time{};
+};
+
+SharedXInputRumbleState gXInputRumbleState;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+const char *XInputStatusName(DWORD status) noexcept
+{
+    switch (status)
     {
-        return static_cast<float>(value) / 255.0f;
-    }
-
-    bool IsPressed(WORD buttons, WORD mask)
-    {
-        return (buttons & mask) != 0;
-    }
-
-    float ApplyDeadzone(float value, float deadzone)
-    {
-        if (std::fabs(value) <= deadzone)
-            return 0.0f;
-
-        const float sign = value < 0.0f ? -1.0f : 1.0f;
-
-        const float magnitude =
-            (std::fabs(value) - deadzone) /
-            (1.0f - deadzone);
-
-        return sign * std::clamp(magnitude, 0.0f, 1.0f);
+        case ERROR_SUCCESS:
+            return "ERROR_SUCCESS";
+        case ERROR_DEVICE_NOT_CONNECTED:
+            return "ERROR_DEVICE_NOT_CONNECTED";
+        case ERROR_INVALID_FUNCTION:
+            return "ERROR_INVALID_FUNCTION";
+        case ERROR_ACCESS_DENIED:
+            return "ERROR_ACCESS_DENIED";
+        case ERROR_BUSY:
+            return "ERROR_BUSY";
+        default:
+            return "OTHER_ERROR";
     }
 }
 
-// ============================================================================
-// Constructor
-// ============================================================================
-
-ControllerDevice::ControllerDevice(vr::ETrackedControllerRole role)
-    : role_(role),
-      device_id_(vr::k_unTrackedDeviceIndexInvalid)
+XInputSnapshot ReadFirstConnectedXInput()
 {
+    XInputSnapshot snapshot{};
+    snapshot.slot_status.fill(ERROR_DEVICE_NOT_CONNECTED);
+
+    if (!InitializeXInput())
+    {
+        GetDriver()->Log("[XboxVR][S4] XInput 1.4 initialization failed");
+        return snapshot;
+    }
+
+    // Scan every XInput slot so the diagnostic report can distinguish a missing
+    // controller from a controller that is connected on a non-zero user index.
+    for (DWORD userIndex = 0; userIndex < XUSER_MAX_COUNT; ++userIndex)
+    {
+        XINPUT_STATE state{};
+        const DWORD result = gXInputGetState(userIndex, &state);
+        snapshot.slot_status[userIndex] = result;
+
+        if (result == ERROR_SUCCESS && !snapshot.connected)
+        {
+            snapshot.connected = true;
+            snapshot.user_index = userIndex;
+            snapshot.state = state;
+        }
+    }
+
+    return snapshot;
 }
 
-// ============================================================================
-// Activate
-// ============================================================================
-
-vr::EVRInitError ControllerDevice::Activate(uint32_t unObjectId)
+void QueueXInputRumble(bool leftMotor, float amplitude, float durationSeconds)
 {
-    vr::VRDriverLog()->Log(
-        "[XboxVR][S3] ControllerDevice::Activate entered\n");
+    const float safeDuration = std::isfinite(durationSeconds)
+                                   ? std::fmax(durationSeconds, kMinHapticDurationSeconds)
+                                   : kMinHapticDurationSeconds;
+    const auto endTime = std::chrono::steady_clock::now() +
+                         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                             std::chrono::duration<float>(safeDuration));
+    const float safeAmplitude = std::isfinite(amplitude) ? Clamp01(amplitude) : 0.0f;
 
-    device_id_ = unObjectId;
-
-    const vr::PropertyContainerHandle_t container =
-        vr::VRProperties()->TrackedDeviceToPropertyContainer(
-            unObjectId);
-
-    // -------------------------------------------------------------------------
-    // Controller role
-    // -------------------------------------------------------------------------
-
-    vr::VRProperties()->SetInt32Property(
-        container,
-        vr::Prop_ControllerRoleHint_Int32,
-        role_);
-
-    // -------------------------------------------------------------------------
-    // Controller identification
-    // -------------------------------------------------------------------------
-
-    vr::VRProperties()->SetStringProperty(
-        container,
-        vr::Prop_ManufacturerName_String,
-        "XboxVR");
-
-    vr::VRProperties()->SetStringProperty(
-        container,
-        vr::Prop_ModelNumber_String,
-        "XboxVR Virtual Controller");
-
-    vr::VRProperties()->SetStringProperty(
-        container,
-        vr::Prop_SerialNumber_String,
-        role_ == vr::TrackedControllerRole_LeftHand
-            ? "XboxVR_Left"
-            : "XboxVR_Right");
-
-    vr::VRProperties()->SetStringProperty(
-        container,
-        vr::Prop_ControllerType_String,
-        "xbox360_controller");
-
-    // -------------------------------------------------------------------------
-    // Input profile
-    // -------------------------------------------------------------------------
-
-    vr::VRProperties()->SetStringProperty(
-        container,
-        vr::Prop_InputProfilePath_String,
-        "{openvr-emulator}/resources/input/openvr-emulator_controller_bindings.json");
-
-    // -------------------------------------------------------------------------
-    // Boolean inputs
-    // -------------------------------------------------------------------------
-
-    vr::VRDriverInput()->CreateBooleanComponent(
-        container,
-        "/input/a/click",
-        &input_handles_[kInputHandle_A_click]);
-
-    vr::VRDriverInput()->CreateBooleanComponent(
-        container,
-        "/input/b/click",
-        &input_handles_[kInputHandle_B_click]);
-
-    vr::VRDriverInput()->CreateBooleanComponent(
-        container,
-        "/input/x/click",
-        &input_handles_[kInputHandle_X_click]);
-
-    vr::VRDriverInput()->CreateBooleanComponent(
-        container,
-        "/input/y/click",
-        &input_handles_[kInputHandle_Y_click]);
-
-    vr::VRDriverInput()->CreateBooleanComponent(
-        container,
-        "/input/system/click",
-        &input_handles_[kInputHandle_System_click]);
-
-    vr::VRDriverInput()->CreateBooleanComponent(
-        container,
-        "/input/menu/click",
-        &input_handles_[kInputHandle_Menu_click]);
-
-    vr::VRDriverInput()->CreateBooleanComponent(
-        container,
-        "/input/grip/click",
-        &input_handles_[kInputHandle_Grip_click]);
-
-    vr::VRDriverInput()->CreateBooleanComponent(
-        container,
-        "/input/joystick/click",
-        &input_handles_[kInputHandle_Joystick_click]);
-
-    // -------------------------------------------------------------------------
-    // Trigger
-    // -------------------------------------------------------------------------
-
-    vr::VRDriverInput()->CreateScalarComponent(
-        container,
-        "/input/trigger/value",
-        &input_handles_[kInputHandle_Trigger_value],
-        vr::VRScalarType_Absolute,
-        vr::VRScalarUnits_NormalizedOneSided);
-
-    vr::VRDriverInput()->CreateBooleanComponent(
-        container,
-        "/input/trigger/click",
-        &input_handles_[kInputHandle_Trigger_click]);
-
-    // -------------------------------------------------------------------------
-    // Joystick
-    // -------------------------------------------------------------------------
-
-    vr::VRDriverInput()->CreateScalarComponent(
-        container,
-        "/input/joystick/x",
-        &input_handles_[kInputHandle_Joystick_x],
-        vr::VRScalarType_Absolute,
-        vr::VRScalarUnits_NormalizedTwoSided);
-
-    vr::VRDriverInput()->CreateScalarComponent(
-        container,
-        "/input/joystick/y",
-        &input_handles_[kInputHandle_Joystick_y],
-        vr::VRScalarType_Absolute,
-        vr::VRScalarUnits_NormalizedTwoSided);
-
-    // -------------------------------------------------------------------------
-    // Haptic
-    // -------------------------------------------------------------------------
-
-    vr::VRDriverInput()->CreateHapticComponent(
-        container,
-        "/output/haptic",
-        &input_handles_[kInputHandle_Haptic]);
-
-    // -------------------------------------------------------------------------
-    // Initialize XInput
-    // -------------------------------------------------------------------------
-
-    if (InitializeXInput())
+    if (leftMotor)
     {
-        vr::VRDriverLog()->Log(
-            "[XboxVR][S3] Explicit xinput1_4.dll initialization SUCCESS\n");
+        gXInputRumbleState.left_motor = safeAmplitude;
+        gXInputRumbleState.left_motor_end_time = endTime;
     }
     else
     {
-        vr::VRDriverLog()->Log(
-            "[XboxVR][S3] Explicit xinput1_4.dll initialization FAILED\n");
+        gXInputRumbleState.right_motor = safeAmplitude;
+        gXInputRumbleState.right_motor_end_time = endTime;
     }
-
-    vr::VRDriverLog()->Log(
-        role_ == vr::TrackedControllerRole_LeftHand
-            ? "[XboxVR][S3] LEFT controller input components created\n"
-            : "[XboxVR][S3] RIGHT controller input components created\n");
-
-    return vr::VRInitError_None;
 }
 
-// ============================================================================
-// Update
-// ============================================================================
-
-void ControllerDevice::Update()
+void ApplyXInputRumble(const XInputSnapshot &snapshot)
 {
-    XINPUT_STATE state{};
-
-    const bool connected = ReadFirstConnectedXInput(state);
-
-    if (!connected)
+    if (!InitializeXInput())
     {
-        // Send neutral values when controller is disconnected.
-        vr::VRDriverInput()->UpdateScalarComponent(
-            input_handles_[kInputHandle_Joystick_x],
-            0.0f,
-            0.0);
-
-        vr::VRDriverInput()->UpdateScalarComponent(
-            input_handles_[kInputHandle_Joystick_y],
-            0.0f,
-            0.0);
-
-        vr::VRDriverInput()->UpdateScalarComponent(
-            input_handles_[kInputHandle_Trigger_value],
-            0.0f,
-            0.0);
-
-        vr::VRDriverInput()->UpdateBooleanComponent(
-            input_handles_[kInputHandle_A_click],
-            false,
-            0.0);
-
-        vr::VRDriverInput()->UpdateBooleanComponent(
-            input_handles_[kInputHandle_B_click],
-            false,
-            0.0);
-
-        vr::VRDriverInput()->UpdateBooleanComponent(
-            input_handles_[kInputHandle_X_click],
-            false,
-            0.0);
-
-        vr::VRDriverInput()->UpdateBooleanComponent(
-            input_handles_[kInputHandle_Y_click],
-            false,
-            0.0);
-
-        vr::VRDriverInput()->UpdateBooleanComponent(
-            input_handles_[kInputHandle_System_click],
-            false,
-            0.0);
-
-        vr::VRDriverInput()->UpdateBooleanComponent(
-            input_handles_[kInputHandle_Menu_click],
-            false,
-            0.0);
-
-        vr::VRDriverInput()->UpdateBooleanComponent(
-            input_handles_[kInputHandle_Grip_click],
-            false,
-            0.0);
-
-        vr::VRDriverInput()->UpdateBooleanComponent(
-            input_handles_[kInputHandle_Joystick_click],
-            false,
-            0.0);
-
-        vr::VRDriverInput()->UpdateBooleanComponent(
-            input_handles_[kInputHandle_Trigger_click],
-            false,
-            0.0);
-
         return;
     }
 
-    // ========================================================================
-    // Raw Xbox values
-    // ========================================================================
+    const auto now = std::chrono::steady_clock::now();
 
-    const WORD buttons = state.Gamepad.wButtons;
-
-    // ========================================================================
-    // Determine which physical Xbox controller inputs belong to this VR hand
-    // ========================================================================
-
-    const bool isLeft =
-        role_ == vr::TrackedControllerRole_LeftHand;
-
-    // Left VR controller:
-    //   Left stick
-    //   LT
-    //   LB
-    //   X
-    //   Y
-    //   Back
-    //
-    // Right VR controller:
-    //   Right stick
-    //   RT
-    //   RB
-    //   A
-    //   B
-    //   Start
-
-    float joystickX;
-    float joystickY;
-    float trigger;
-
-    bool a;
-    bool b;
-    bool x;
-    bool y;
-    bool system;
-    bool menu;
-    bool grip;
-    bool joystickClick;
-
-    if (isLeft)
+    if (now >= gXInputRumbleState.left_motor_end_time)
     {
-        joystickX = NormalizeStick(state.Gamepad.sThumbLX);
-        joystickY = NormalizeStick(state.Gamepad.sThumbLY);
+        gXInputRumbleState.left_motor = 0.0f;
+    }
+    if (now >= gXInputRumbleState.right_motor_end_time)
+    {
+        gXInputRumbleState.right_motor = 0.0f;
+    }
 
-        trigger = NormalizeTrigger(
-            state.Gamepad.bLeftTrigger);
+    if (snapshot.connected)
+    {
+        gXInputRumbleState.user_index = snapshot.user_index;
+        gXInputRumbleState.has_user = true;
+    }
 
-        a = false;
-        b = false;
+    if (!gXInputRumbleState.has_user)
+    {
+        return;
+    }
 
-        x = IsPressed(
-            buttons,
-            XINPUT_GAMEPAD_X);
+    XINPUT_VIBRATION vibration{};
+    vibration.wLeftMotorSpeed = static_cast<WORD>(gXInputRumbleState.left_motor * kMaxMotorSpeed);
+    vibration.wRightMotorSpeed = static_cast<WORD>(gXInputRumbleState.right_motor * kMaxMotorSpeed);
 
-        y = IsPressed(
-            buttons,
-            XINPUT_GAMEPAD_Y);
+    const DWORD result = gXInputSetState(gXInputRumbleState.user_index, &vibration);
+    if (result != ERROR_SUCCESS)
+    {
+        gXInputRumbleState.has_user = false;
+        gXInputRumbleState.left_motor = 0.0f;
+        gXInputRumbleState.right_motor = 0.0f;
+    }
+}
 
-        system = IsPressed(
-            buttons,
-            XINPUT_GAMEPAD_BACK);
+bool ButtonPressed(const XInputSnapshot &snapshot, WORD mask) noexcept
+{
+    return snapshot.connected && mask != 0 && (snapshot.state.Gamepad.wButtons & mask) != 0;
+}
 
-        menu = false;
+float ApplySensitivity(float value, float sensitivity) noexcept
+{
+    const float scaled = value * std::abs(sensitivity);
+    return std::fmax(-1.0f, std::fmin(scaled, 1.0f));
+}
 
-        grip = IsPressed(
-            buttons,
-            XINPUT_GAMEPAD_LEFT_SHOULDER);
+}  // namespace
 
-        joystickClick = IsPressed(
-            buttons,
-            XINPUT_GAMEPAD_LEFT_THUMB);
+namespace OpenVREmulatorDriver
+{
+
+ControllerDevice::ControllerDevice(std::string serial, ControllerDevice::Handedness handedness,
+                                   InputConfig config)
+    : serial_(std::move(serial)), handedness_(handedness), config_(config)
+{
+}
+
+std::string ControllerDevice::GetSerial()
+{
+    return this->serial_;
+}
+
+void ControllerDevice::Update()
+{
+    if (this->device_index_ == vr::k_unTrackedDeviceIndexInvalid)
+    {
+        return;
+    }
+
+    const float deltaSeconds = static_cast<float>(GetDriver()->GetLastFrameTime().count()) /
+                               kMillisecondsPerSecond;
+
+    const auto events = GetDriver()->GetOpenVREvents();
+    for (const auto &event : events)
+    {
+        if (event.eventType != vr::EVREventType::VREvent_Input_HapticVibration ||
+            event.data.hapticVibration.componentHandle != this->haptic_component_)
+        {
+            continue;
+        }
+
+        this->did_vibrate_ = true;
+        this->vibrate_anim_state_ = 0.0f;
+        const bool leftMotor = this->handedness_ == Handedness::LEFT;
+        QueueXInputRumble(leftMotor, event.data.hapticVibration.fAmplitude,
+                          event.data.hapticVibration.fDurationSeconds);
+    }
+
+    if (this->did_vibrate_)
+    {
+        this->vibrate_anim_state_ += deltaSeconds;
+        if (this->vibrate_anim_state_ >= 1.0f)
+        {
+            this->did_vibrate_ = false;
+            this->vibrate_anim_state_ = 0.0f;
+        }
+    }
+
+    const XInputSnapshot snapshot = ReadFirstConnectedXInput();
+
+    // Diagnostic logging is intentionally rate-limited so vrserver.txt remains readable.
+    // One report per second contains the complete XInput scan plus the values that this
+    // controller will send to SteamVR.
+    const auto diagnosticNow = std::chrono::steady_clock::now();
+    if (!gXInputDiagnostic.has_logged_once ||
+        diagnosticNow - gXInputDiagnostic.last_log_time >= std::chrono::seconds(1))
+    {
+        gXInputDiagnostic.has_logged_once = true;
+        gXInputDiagnostic.last_log_time = diagnosticNow;
+
+        std::ostringstream diagnostic;
+        diagnostic << "[XboxVR][S4] XInput scan: ";
+        for (DWORD slot = 0; slot < XUSER_MAX_COUNT; ++slot)
+        {
+            diagnostic << "slot" << slot << "=" << XInputStatusName(snapshot.slot_status[slot]);
+            if (slot + 1 < XUSER_MAX_COUNT)
+            {
+                diagnostic << ", ";
+            }
+        }
+
+        if (snapshot.connected)
+        {
+            const auto &gamepad = snapshot.state.Gamepad;
+            diagnostic << " | CONNECTED slot=" << snapshot.user_index
+                       << " buttons=" << gamepad.wButtons
+                       << " LX=" << gamepad.sThumbLX
+                       << " LY=" << gamepad.sThumbLY
+                       << " RX=" << gamepad.sThumbRX
+                       << " RY=" << gamepad.sThumbRY
+                       << " LT=" << static_cast<int>(gamepad.bLeftTrigger)
+                       << " RT=" << static_cast<int>(gamepad.bRightTrigger);
+        }
+        else
+        {
+            diagnostic << " | NO XINPUT CONTROLLER";
+        }
+
+        GetDriver()->Log(diagnostic.str());
+        GetDriver()->Log(std::string("[XboxVR][S5] XInput state ") +
+                         (snapshot.connected ? "accepted from connected controller"
+                                              : "not available; using neutral input values"));
+    }
+
+    const ControllerInputConfig &controllerConfig =
+        this->handedness_ == Handedness::LEFT ? static_cast<const ControllerInputConfig &>(config_.left_controller)
+                                              : static_cast<const ControllerInputConfig &>(config_.right_controller);
+
+    auto pose = IVRDevice::MakeDefaultPose();
+
+    // Controllers follow the HMD pose and sit slightly below/aside it.
+    const auto devices = GetDriver()->GetDevices();
+    IVRDevice *hmdDevice = nullptr;
+    for (const auto &device : devices)
+    {
+        if (device->GetDeviceType() == DeviceType::HMD)
+        {
+            hmdDevice = device.get();
+            break;
+        }
+    }
+
+    if (hmdDevice != nullptr)
+    {
+        const vr::DriverPose_t hmdPose = hmdDevice->GetPose();
+        const XMFLOAT3 hmdPosition{static_cast<float>(hmdPose.vecPosition[0]),
+                                   static_cast<float>(hmdPose.vecPosition[1]),
+                                   static_cast<float>(hmdPose.vecPosition[2])};
+        const XMFLOAT4 hmdRotation{static_cast<float>(hmdPose.qRotation.x),
+                                   static_cast<float>(hmdPose.qRotation.y),
+                                   static_cast<float>(hmdPose.qRotation.z),
+                                   static_cast<float>(hmdPose.qRotation.w)};
+
+        const float controllerY =
+            kVibrateYOffset +
+            kVibrateAmplitude *
+                std::sin(kVibrateFrequency * kPi * this->vibrate_anim_state_);
+        const float controllerX = this->handedness_ == Handedness::LEFT
+                                      ? -kControllerXOffset
+                                      : (this->handedness_ == Handedness::RIGHT ? kControllerXOffset : 0.0f);
+
+        const XMFLOAT3 offset{controllerX, controllerY, kControllerZOffset};
+        XMFLOAT3 rotatedOffset{};
+        XMStoreFloat3(&rotatedOffset,
+                      XMVector3Rotate(XMLoadFloat3(&offset), XMLoadFloat4(&hmdRotation)));
+
+        pose.vecPosition[0] = rotatedOffset.x + hmdPosition.x;
+        pose.vecPosition[1] = rotatedOffset.y + hmdPosition.y;
+        pose.vecPosition[2] = rotatedOffset.z + hmdPosition.z;
+        pose.qRotation = hmdPose.qRotation;
+    }
+
+    const bool aPressed = ButtonPressed(snapshot, controllerConfig.btn_a);
+    const bool bPressed = ButtonPressed(snapshot, controllerConfig.btn_b);
+    const bool xPressed = ButtonPressed(snapshot, controllerConfig.btn_x);
+    const bool yPressed = ButtonPressed(snapshot, controllerConfig.btn_y);
+    const bool gripPressed = ButtonPressed(snapshot, controllerConfig.btn_grip);
+    const bool systemPressed = ButtonPressed(snapshot, controllerConfig.btn_system);
+    const bool joystickClick = ButtonPressed(snapshot, controllerConfig.btn_joystick_click);
+
+    const SHORT stickX = this->handedness_ == Handedness::LEFT
+                             ? snapshot.state.Gamepad.sThumbLX
+                             : snapshot.state.Gamepad.sThumbRX;
+    const SHORT stickY = this->handedness_ == Handedness::LEFT
+                             ? snapshot.state.Gamepad.sThumbLY
+                             : snapshot.state.Gamepad.sThumbRY;
+    const BYTE triggerRaw = this->handedness_ == Handedness::LEFT
+                                ? snapshot.state.Gamepad.bLeftTrigger
+                                : snapshot.state.Gamepad.bRightTrigger;
+
+    float joystickX = NormalizeThumbAxis(stickX, controllerConfig.stick_deadzone);
+    float joystickY = NormalizeThumbAxis(stickY, controllerConfig.stick_deadzone);
+    joystickX = ApplySensitivity(joystickX, controllerConfig.stick_sensitivity);
+    joystickY = ApplySensitivity(joystickY, controllerConfig.stick_sensitivity);
+
+    const float triggerValue = NormalizeTrigger(triggerRaw, controllerConfig.trigger_deadzone);
+    const float triggerClickThreshold = Clamp01(controllerConfig.trigger_click_threshold);
+
+    if (gXInputDiagnostic.has_logged_once &&
+        diagnosticNow - gXInputDiagnostic.last_log_time < std::chrono::milliseconds(50))
+    {
+        std::ostringstream values;
+        values << "[XboxVR][S6] "
+               << (this->handedness_ == Handedness::LEFT ? "LEFT" : "RIGHT")
+               << " normalized: joystickX=" << joystickX
+               << " joystickY=" << joystickY
+               << " trigger=" << triggerValue
+               << " triggerClick=" << (triggerValue >= triggerClickThreshold ? 1 : 0);
+        GetDriver()->Log(values.str());
+    }
+
+    const WORD dpadHorizontalMask = XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_DPAD_RIGHT;
+    const WORD dpadVerticalMask = XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_DOWN;
+    const bool dpadLeft = ButtonPressed(snapshot, XINPUT_GAMEPAD_DPAD_LEFT);
+    const bool dpadRight = ButtonPressed(snapshot, XINPUT_GAMEPAD_DPAD_RIGHT);
+    const bool dpadUp = ButtonPressed(snapshot, XINPUT_GAMEPAD_DPAD_UP);
+    const bool dpadDown = ButtonPressed(snapshot, XINPUT_GAMEPAD_DPAD_DOWN);
+    const bool dpadPressed = ButtonPressed(snapshot, dpadHorizontalMask) ||
+                             ButtonPressed(snapshot, dpadVerticalMask);
+
+    float trackpadX = 0.0f;
+    float trackpadY = 0.0f;
+    if (controllerConfig.dpad_to_trackpad)
+    {
+        trackpadX = (dpadRight ? kTrackpadDigitalValue : 0.0f) -
+                    (dpadLeft ? kTrackpadDigitalValue : 0.0f);
+        trackpadY = (dpadUp ? kTrackpadDigitalValue : 0.0f) -
+                    (dpadDown ? kTrackpadDigitalValue : 0.0f);
+    }
+
+    auto updateButton = [this](vr::VRInputComponentHandle_t click,
+                               vr::VRInputComponentHandle_t touch, bool pressed) {
+        GetDriver()->GetInput()->UpdateBooleanComponent(click, pressed, 0);
+        GetDriver()->GetInput()->UpdateBooleanComponent(touch, pressed, 0);
+    };
+    auto updateScalar = [this](vr::VRInputComponentHandle_t component, float value) {
+        GetDriver()->GetInput()->UpdateScalarComponent(component, value, 0);
+    };
+
+    updateButton(this->a_button_click_component_, this->a_button_touch_component_, aPressed);
+    updateButton(this->b_button_click_component_, this->b_button_touch_component_, bPressed);
+    updateButton(this->x_button_click_component_, this->x_button_touch_component_, xPressed);
+    updateButton(this->y_button_click_component_, this->y_button_touch_component_, yPressed);
+
+    GetDriver()->GetInput()->UpdateBooleanComponent(
+        this->trigger_click_component_, triggerValue >= triggerClickThreshold, 0);
+    GetDriver()->GetInput()->UpdateBooleanComponent(
+        this->trigger_touch_component_, triggerValue > 0.0f, 0);
+    updateScalar(this->trigger_value_component_, triggerValue);
+
+    GetDriver()->GetInput()->UpdateBooleanComponent(
+        this->grip_touch_component_, gripPressed, 0);
+    updateScalar(this->grip_value_component_, gripPressed ? 1.0f : 0.0f);
+    updateScalar(this->grip_force_component_, gripPressed ? 1.0f : 0.0f);
+
+    updateButton(this->system_click_component_, this->system_touch_component_, systemPressed);
+
+    updateButton(this->trackpad_click_component_, this->trackpad_touch_component_, dpadPressed);
+    updateScalar(this->trackpad_x_component_, trackpadX);
+    updateScalar(this->trackpad_y_component_, trackpadY);
+
+    GetDriver()->GetInput()->UpdateBooleanComponent(
+        this->joystick_click_component_, joystickClick, 0);
+    GetDriver()->GetInput()->UpdateBooleanComponent(
+        this->joystick_touch_component_,
+        joystickClick || std::abs(joystickX) > kJoystickTouchThreshold ||
+            std::abs(joystickY) > kJoystickTouchThreshold, 0);
+    updateScalar(this->joystick_x_component_, joystickX);
+    updateScalar(this->joystick_y_component_, joystickY);
+
+    if (gXInputDiagnostic.has_logged_once &&
+        diagnosticNow - gXInputDiagnostic.last_log_time < std::chrono::milliseconds(50))
+    {
+        GetDriver()->Log(std::string("[XboxVR][S7] ") +
+                         (this->handedness_ == Handedness::LEFT ? "LEFT" : "RIGHT") +
+                         " OpenVR input components updated");
+    }
+
+    ApplyXInputRumble(snapshot);
+
+    GetDriver()->GetDriverHost()->TrackedDevicePoseUpdated(this->device_index_, pose,
+                                                            sizeof(vr::DriverPose_t));
+    this->last_pose_ = pose;
+}
+
+DeviceType ControllerDevice::GetDeviceType()
+{
+    return DeviceType::CONTROLLER;
+}
+
+vr::TrackedDeviceIndex_t ControllerDevice::GetDeviceIndex()
+{
+    return this->device_index_;
+}
+
+vr::EVRInitError ControllerDevice::Activate(uint32_t unObjectId)
+{
+    this->device_index_ = unObjectId;
+
+    GetDriver()->Log("[XboxVR][S3] Activating Xbox/XInput controller " + this->serial_);
+
+    if (InitializeXInput())
+    {
+        GetDriver()->Log("[XboxVR][S3] Explicit xinput1_4.dll initialization SUCCESS");
     }
     else
     {
-        joystickX = NormalizeStick(state.Gamepad.sThumbRX);
-        joystickY = NormalizeStick(state.Gamepad.sThumbRY);
-
-        trigger = NormalizeTrigger(
-            state.Gamepad.bRightTrigger);
-
-        a = IsPressed(
-            buttons,
-            XINPUT_GAMEPAD_A);
-
-        b = IsPressed(
-            buttons,
-            XINPUT_GAMEPAD_B);
-
-        x = false;
-        y = false;
-
-        system = false;
-
-        menu = IsPressed(
-            buttons,
-            XINPUT_GAMEPAD_START);
-
-        grip = IsPressed(
-            buttons,
-            XINPUT_GAMEPAD_RIGHT_SHOULDER);
-
-        joystickClick = IsPressed(
-            buttons,
-            XINPUT_GAMEPAD_RIGHT_THUMB);
+        GetDriver()->Log("[XboxVR][S3] Explicit xinput1_4.dll initialization FAILED");
     }
 
-    // ========================================================================
-    // Deadzone
-    // ========================================================================
+    const auto props =
+        GetDriver()->GetProperties()->TrackedDeviceToPropertyContainer(this->device_index_);
 
-    constexpr float joystickDeadzone = 0.08f;
+    GetDriver()->GetInput()->CreateHapticComponent(props, "/output/haptic", &this->haptic_component_);
 
-    joystickX = ApplyDeadzone(
-        joystickX,
-        joystickDeadzone);
+    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/a/click",
+                                                    &this->a_button_click_component_);
+    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/a/touch",
+                                                    &this->a_button_touch_component_);
+    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/b/click",
+                                                    &this->b_button_click_component_);
+    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/b/touch",
+                                                    &this->b_button_touch_component_);
+    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/x/click",
+                                                    &this->x_button_click_component_);
+    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/x/touch",
+                                                    &this->x_button_touch_component_);
+    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/y/click",
+                                                    &this->y_button_click_component_);
+    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/y/touch",
+                                                    &this->y_button_touch_component_);
 
-    joystickY = ApplyDeadzone(
-        joystickY,
-        joystickDeadzone);
+    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/trigger/click",
+                                                    &this->trigger_click_component_);
+    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/trigger/touch",
+                                                    &this->trigger_touch_component_);
+    GetDriver()->GetInput()->CreateScalarComponent(
+        props, "/input/trigger/value", &this->trigger_value_component_,
+        vr::EVRScalarType::VRScalarType_Absolute,
+        vr::EVRScalarUnits::VRScalarUnits_NormalizedOneSided);
 
-    // ========================================================================
-    // Trigger click
-    // ========================================================================
+    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/grip/touch",
+                                                    &this->grip_touch_component_);
+    GetDriver()->GetInput()->CreateScalarComponent(
+        props, "/input/grip/value", &this->grip_value_component_,
+        vr::EVRScalarType::VRScalarType_Absolute,
+        vr::EVRScalarUnits::VRScalarUnits_NormalizedOneSided);
+    GetDriver()->GetInput()->CreateScalarComponent(
+        props, "/input/grip/force", &this->grip_force_component_,
+        vr::EVRScalarType::VRScalarType_Absolute,
+        vr::EVRScalarUnits::VRScalarUnits_NormalizedOneSided);
 
-    constexpr float triggerClickThreshold = 0.75f;
+    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/system/click",
+                                                    &this->system_click_component_);
+    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/system/touch",
+                                                    &this->system_touch_component_);
 
-    const bool triggerClick =
-        trigger >= triggerClickThreshold;
+    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/trackpad/click",
+                                                    &this->trackpad_click_component_);
+    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/trackpad/touch",
+                                                    &this->trackpad_touch_component_);
+    GetDriver()->GetInput()->CreateScalarComponent(
+        props, "/input/trackpad/x", &this->trackpad_x_component_,
+        vr::EVRScalarType::VRScalarType_Absolute,
+        vr::EVRScalarUnits::VRScalarUnits_NormalizedTwoSided);
+    GetDriver()->GetInput()->CreateScalarComponent(
+        props, "/input/trackpad/y", &this->trackpad_y_component_,
+        vr::EVRScalarType::VRScalarType_Absolute,
+        vr::EVRScalarUnits::VRScalarUnits_NormalizedTwoSided);
 
-    // ========================================================================
-    // Update OpenVR components
-    // ========================================================================
+    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/joystick/click",
+                                                    &this->joystick_click_component_);
+    GetDriver()->GetInput()->CreateBooleanComponent(props, "/input/joystick/touch",
+                                                    &this->joystick_touch_component_);
+    GetDriver()->GetInput()->CreateScalarComponent(
+        props, "/input/joystick/x", &this->joystick_x_component_,
+        vr::EVRScalarType::VRScalarType_Absolute,
+        vr::EVRScalarUnits::VRScalarUnits_NormalizedTwoSided);
+    GetDriver()->GetInput()->CreateScalarComponent(
+        props, "/input/joystick/y", &this->joystick_y_component_,
+        vr::EVRScalarType::VRScalarType_Absolute,
+        vr::EVRScalarUnits::VRScalarUnits_NormalizedTwoSided);
 
-    vr::VRDriverInput()->UpdateScalarComponent(
-        input_handles_[kInputHandle_Joystick_x],
-        joystickX,
-        0.0);
+    std::ostringstream activation;
+    activation << "[XboxVR][S3] "
+               << (this->handedness_ == Handedness::LEFT ? "LEFT" : "RIGHT")
+               << " input components created: joystick=(" << this->joystick_x_component_
+               << "," << this->joystick_y_component_ << ") trigger="
+               << this->trigger_value_component_ << " grip=" << this->grip_value_component_;
+    GetDriver()->Log(activation.str());
 
-    vr::VRDriverInput()->UpdateScalarComponent(
-        input_handles_[kInputHandle_Joystick_y],
-        joystickY,
-        0.0);
+    GetDriver()->GetProperties()->SetUint64Property(props, vr::Prop_CurrentUniverseId_Uint64, 2);
+    GetDriver()->GetProperties()->SetStringProperty(props, vr::Prop_ModelNumber_String,
+                                                    "openvr-emulator_controller");
 
-    vr::VRDriverInput()->UpdateScalarComponent(
-        input_handles_[kInputHandle_Trigger_value],
-        trigger,
-        0.0);
+    const std::string renderModelName =
+        this->handedness_ == Handedness::LEFT ? "oculus_quest_plus_controller_left"
+                                              : "oculus_quest_plus_controller_right";
+    GetDriver()->GetProperties()->SetStringProperty(props, vr::Prop_RenderModelName_String,
+                                                    renderModelName.c_str());
 
-    vr::VRDriverInput()->UpdateBooleanComponent(
-        input_handles_[kInputHandle_Trigger_click],
-        triggerClick,
-        0.0);
+    const auto role = this->handedness_ == Handedness::LEFT
+                          ? vr::ETrackedControllerRole::TrackedControllerRole_LeftHand
+                          : vr::ETrackedControllerRole::TrackedControllerRole_RightHand;
+    GetDriver()->GetProperties()->SetInt32Property(props, vr::Prop_ControllerRoleHint_Int32, role);
 
-    vr::VRDriverInput()->UpdateBooleanComponent(
-        input_handles_[kInputHandle_A_click],
-        a,
-        0.0);
+    // Keep the source project's stable custom controller type and compatibility profile.
+    // This first Xbox pass intentionally avoids experimental remapping/legacy JSON changes.
+    GetDriver()->GetProperties()->SetStringProperty(
+        props, vr::Prop_ControllerType_String, "openvr-emulator_controller");
+    GetDriver()->GetProperties()->SetStringProperty(
+        props, vr::Prop_InputProfilePath_String,
+        "{openvr-emulator}/input/openvr-emulator_controller_bindings.json");
 
-    vr::VRDriverInput()->UpdateBooleanComponent(
-        input_handles_[kInputHandle_B_click],
-        b,
-        0.0);
+    const std::string handedness =
+        this->handedness_ == Handedness::LEFT ? "left" : "right";
+    const std::string readyIcon = "{openvr-emulator}/icons/controller_ready_" + handedness + ".png";
+    const std::string notReadyIcon = "{openvr-emulator}/icons/controller_not_ready_" + handedness + ".png";
+    GetDriver()->GetProperties()->SetStringProperty(props,
+                                                    vr::Prop_NamedIconPathDeviceReady_String,
+                                                    readyIcon.c_str());
+    GetDriver()->GetProperties()->SetStringProperty(props,
+                                                    vr::Prop_NamedIconPathDeviceOff_String,
+                                                    notReadyIcon.c_str());
+    GetDriver()->GetProperties()->SetStringProperty(props,
+                                                    vr::Prop_NamedIconPathDeviceSearching_String,
+                                                    notReadyIcon.c_str());
+    GetDriver()->GetProperties()->SetStringProperty(props,
+                                                    vr::Prop_NamedIconPathDeviceSearchingAlert_String,
+                                                    notReadyIcon.c_str());
+    GetDriver()->GetProperties()->SetStringProperty(props,
+                                                    vr::Prop_NamedIconPathDeviceReadyAlert_String,
+                                                    readyIcon.c_str());
+    GetDriver()->GetProperties()->SetStringProperty(props,
+                                                    vr::Prop_NamedIconPathDeviceNotReady_String,
+                                                    notReadyIcon.c_str());
+    GetDriver()->GetProperties()->SetStringProperty(props,
+                                                    vr::Prop_NamedIconPathDeviceStandby_String,
+                                                    notReadyIcon.c_str());
+    GetDriver()->GetProperties()->SetStringProperty(props,
+                                                    vr::Prop_NamedIconPathDeviceAlertLow_String,
+                                                    notReadyIcon.c_str());
 
-    vr::VRDriverInput()->UpdateBooleanComponent(
-        input_handles_[kInputHandle_X_click],
-        x,
-        0.0);
-
-    vr::VRDriverInput()->UpdateBooleanComponent(
-        input_handles_[kInputHandle_Y_click],
-        y,
-        0.0);
-
-    vr::VRDriverInput()->UpdateBooleanComponent(
-        input_handles_[kInputHandle_System_click],
-        system,
-        0.0);
-
-    vr::VRDriverInput()->UpdateBooleanComponent(
-        input_handles_[kInputHandle_Menu_click],
-        menu,
-        0.0);
-
-    vr::VRDriverInput()->UpdateBooleanComponent(
-        input_handles_[kInputHandle_Grip_click],
-        grip,
-        0.0);
-
-    vr::VRDriverInput()->UpdateBooleanComponent(
-        input_handles_[kInputHandle_Joystick_click],
-        joystickClick,
-        0.0);
-
-    // ========================================================================
-    // Diagnostic output
-    // ========================================================================
-
-    char buffer[768];
-
-    snprintf(
-        buffer,
-        sizeof(buffer),
-        "[XboxVR][S6/S7] %s "
-        "LX=%.3f LY=%.3f RX=%.3f RY=%.3f "
-        "LT=%.3f RT=%.3f Buttons=0x%04X\n",
-
-        isLeft ? "LEFT" : "RIGHT",
-
-        NormalizeStick(state.Gamepad.sThumbLX),
-        NormalizeStick(state.Gamepad.sThumbLY),
-        NormalizeStick(state.Gamepad.sThumbRX),
-        NormalizeStick(state.Gamepad.sThumbRY),
-
-        NormalizeTrigger(state.Gamepad.bLeftTrigger),
-        NormalizeTrigger(state.Gamepad.bRightTrigger),
-
-        static_cast<unsigned int>(buttons));
-
-    vr::VRDriverLog()->Log(buffer);
+    return vr::EVRInitError::VRInitError_None;
 }
-
-// ============================================================================
-// Pose
-// ============================================================================
-
-vr::DriverPose_t ControllerDevice::GetPose()
-{
-    vr::DriverPose_t pose{};
-
-    pose.poseIsValid = true;
-    pose.result = vr::TrackingResult_Running_OK;
-    pose.deviceIsConnected = true;
-
-    pose.qWorldFromDriverRotation.w = 1.0;
-    pose.qDriverFromHeadRotation.w = 1.0;
-    pose.qRotation.w = 1.0;
-
-    vr::TrackedDevicePose_t hmdPose{};
-
-    vr::VRServerDriverHost()->GetRawTrackedDevicePoses(
-        0.0f,
-        &hmdPose,
-        1);
-
-    if (hmdPose.bPoseIsValid)
-    {
-        pose.qRotation.w = 1.0;
-        pose.qRotation.x = 0.0;
-        pose.qRotation.y = 0.0;
-        pose.qRotation.z = 0.0;
-
-        pose.vecPosition[0] =
-            hmdPose.mDeviceToAbsoluteTracking.m[0][3] +
-            (role_ == vr::TrackedControllerRole_LeftHand
-                ? -0.20f
-                : 0.20f);
-
-        pose.vecPosition[1] =
-            hmdPose.mDeviceToAbsoluteTracking.m[1][3];
-
-        pose.vecPosition[2] =
-            hmdPose.mDeviceToAbsoluteTracking.m[2][3] -
-            0.50f;
-    }
-
-    return pose;
-}
-
-// ============================================================================
-// Deactivate
-// ============================================================================
 
 void ControllerDevice::Deactivate()
 {
-    device_id_ =
-        vr::k_unTrackedDeviceIndexInvalid;
+    this->device_index_ = vr::k_unTrackedDeviceIndexInvalid;
 }
 
-// ============================================================================
-// Standby
-// ============================================================================
+void ControllerDevice::EnterStandby() {}
 
-void ControllerDevice::EnterStandby()
-{
-}
-
-// ============================================================================
-// GetComponent
-// ============================================================================
-
-void* ControllerDevice::GetComponent(
-    const char* pchComponentNameAndVersion)
+void *ControllerDevice::GetComponent(const char * /*pchComponentNameAndVersion*/)
 {
     return nullptr;
 }
 
-// ============================================================================
-// DebugRequest
-// ============================================================================
-
-void ControllerDevice::DebugRequest(
-    const char* pchRequest,
-    char* pchResponseBuffer,
-    uint32_t unResponseBufferSize)
+void ControllerDevice::DebugRequest(const char * /*pchRequest*/, char *pchResponseBuffer,
+                                    uint32_t unResponseBufferSize)
 {
-    if (unResponseBufferSize >= 1)
-        pchResponseBuffer[0] = 0;
+    if (unResponseBufferSize > 0)
+    {
+        *pchResponseBuffer = 0;
+    }
 }
+
+vr::DriverPose_t ControllerDevice::GetPose()
+{
+    return this->last_pose_;
+}
+
+}  // namespace OpenVREmulatorDriver
