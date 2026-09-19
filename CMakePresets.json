@@ -1,0 +1,96 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired": {"major": 3, "minor": 16, "patch": 0},
+    "configurePresets": [
+        {
+            "name": "windows-msvc-debug",
+            "displayName": "Windows MSVC Debug",
+            "generator": "Visual Studio 17 2022",
+            "binaryDir": "${sourceDir}/build",
+            "architecture": {"value": "x64", "strategy": "set"},
+            "cacheVariables": {
+                "BUILD_PREVIEW_APP": "OFF",
+                "BUILD_TESTING": "OFF",
+                "OPENVR_EMULATOR_SKIP_DEPLOY": "ON"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        },
+        {
+            "name": "windows-msvc-release",
+            "displayName": "Windows MSVC Release",
+            "generator": "Visual Studio 17 2022",
+            "binaryDir": "${sourceDir}/build",
+            "architecture": {"value": "x64", "strategy": "set"},
+            "cacheVariables": {
+                "BUILD_PREVIEW_APP": "OFF",
+                "BUILD_TESTING": "OFF",
+                "OPENVR_EMULATOR_SKIP_DEPLOY": "ON"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        },
+        {
+            "name": "ci-debug",
+            "displayName": "CI Debug",
+            "generator": "Ninja Multi-Config",
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "BUILD_PREVIEW_APP": "OFF",
+                "BUILD_TESTING": "OFF",
+                "OPENVR_EMULATOR_SKIP_DEPLOY": "ON",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        },
+        {
+            "name": "ci-release",
+            "displayName": "CI Release",
+            "generator": "Ninja Multi-Config",
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "BUILD_PREVIEW_APP": "OFF",
+                "BUILD_TESTING": "OFF",
+                "OPENVR_EMULATOR_SKIP_DEPLOY": "ON",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "windows-msvc-debug",
+            "configurePreset": "windows-msvc-debug",
+            "configuration": "Debug"
+        },
+        {
+            "name": "windows-msvc-release",
+            "configurePreset": "windows-msvc-release",
+            "configuration": "Release"
+        },
+        {
+            "name": "ci-debug",
+            "configurePreset": "ci-debug",
+            "configuration": "Debug"
+        },
+        {
+            "name": "ci-release",
+            "configurePreset": "ci-release",
+            "configuration": "Release"
+        }
+    ]
+}
