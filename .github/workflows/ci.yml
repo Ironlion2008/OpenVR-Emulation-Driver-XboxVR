@@ -87,8 +87,36 @@ jobs:
         if: matrix.config == 'Release'
         shell: pwsh
         run: |
-          & "$env:GITHUB_WORKSPACE\tools\XboxVR-HIDMaestroBridge\setup_hidmaestro.ps1"
+          $bridgeRoot = "$env:GITHUB_WORKSPACE\tools\XboxVR-HIDMaestroBridge"
+
+          & "$bridgeRoot\setup_hidmaestro.ps1" -SkipBuild
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          dotnet publish "$bridgeRoot\XboxVR-HIDMaestroBridge.csproj" `
+            --configuration Release `
+            --runtime win-x64 `
+            --self-contained false `
+            --output "$bridgeRoot\publish"
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          if (!(Test-Path "$bridgeRoot\publish\XboxVR-HIDMaestroBridge.exe")) {
+            Write-Error "HIDMaestro bridge executable was not produced."
+            Get-ChildItem "$bridgeRoot" -Recurse | Select-Object FullName
+            exit 1
+          }
+
+          if (!(Test-Path "$bridgeRoot\publish\HIDMaestro.Core.dll")) {
+            Write-Error "HIDMaestro.Core.dll was not produced/copied."
+            Get-ChildItem "$bridgeRoot" -Recurse | Select-Object FullName
+            exit 1
+          }
+
+          Write-Host "HIDMaestro bridge publish succeeded."
+          Get-ChildItem "$bridgeRoot\publish" -File |
+            ForEach-Object { Write-Host $_.FullName }
 
       - name: Prepare complete SteamVR driver
         if: matrix.config == 'Release'
