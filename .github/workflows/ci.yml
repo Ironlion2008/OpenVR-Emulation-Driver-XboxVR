@@ -102,6 +102,7 @@ jobs:
             Write-Error "driver.vrdrivermanifest not found at $source"
             exit 1
           }
+
           if (!(Test-Path "$source\resources")) {
             Write-Error "Driver resources directory not found at $source"
             exit 1
@@ -116,21 +117,95 @@ jobs:
 
           $destinationBin = "$package\bin\win64"
           New-Item -ItemType Directory -Path $destinationBin -Force | Out-Null
-          Copy-Item "$env:DRIVER_DLL" "$destinationBin\driver_openvr-emulator.dll" -Force
+
+          Copy-Item `
+            "$env:DRIVER_DLL" `
+            "$destinationBin\driver_openvr-emulator.dll" `
+            -Force
 
           Write-Host "Complete SteamVR driver package:"
-          Get-ChildItem $packageRoot -Recurse -File | ForEach-Object { Write-Host $_.FullName }
+          Get-ChildItem $packageRoot -Recurse -File |
+            ForEach-Object { Write-Host $_.FullName }
 
-          # Package the HIDMaestro consumer bridge beside the HMD driver.
-          $bridgeOut = "$env:GITHUB_WORKSPACE\tools\XboxVR-HIDMaestroBridge\bin\Release\net10.0-windows10.0.19041.0\win-x64"
+          # ------------------------------------------------------------
+          # Package HIDMaestro consumer bridge.
+          # Find the actual win-x64 output directory instead of assuming
+          # a specific .NET target-framework path.
+          # ------------------------------------------------------------
+
+          $bridgeRoot = "$env:GITHUB_WORKSPACE\tools\XboxVR-HIDMaestroBridge"
           $bridgePackage = "$packageRoot\XboxVR-HIDMaestroBridge"
-          New-Item -ItemType Directory -Path $bridgePackage -Force | Out-Null
-          Copy-Item "$bridgeOut\*" "$bridgePackage\" -Recurse -Force
-          Copy-Item "$env:GITHUB_WORKSPACE\Launch-XboxVR.ps1" "$packageRoot\Launch-XboxVR.ps1" -Force
-          Copy-Item "$env:GITHUB_WORKSPACE\tools\XboxVR-HIDMaestroBridge\setup_hidmaestro.ps1" "$bridgePackage\setup_hidmaestro.ps1" -Force
 
-          if (!(Test-Path "$bridgePackage\XboxVR-HIDMaestroBridge.exe")) { throw "Bridge executable missing." }
-          if (!(Test-Path "$bridgePackage\HIDMaestro.Core.dll")) { throw "HIDMaestro.Core.dll missing." }
+          Write-Host ""
+          Write-Host "Searching for HIDMaestro bridge output..."
+
+          $bridgeOut = Get-ChildItem `
+            "$bridgeRoot\bin\Release" `
+            -Directory `
+            -Recurse |
+            Where-Object {
+              $_.Name -eq "win-x64"
+            } |
+            Select-Object -First 1
+
+          if (-not $bridgeOut) {
+            Write-Error "XboxVR-HIDMaestroBridge win-x64 output directory was not found."
+
+            Write-Host ""
+            Write-Host "Contents of bridge bin directory:"
+            if (Test-Path "$bridgeRoot\bin") {
+              Get-ChildItem "$bridgeRoot\bin" -Recurse |
+                Select-Object FullName
+            }
+            else {
+              Write-Host "Bridge bin directory does not exist."
+            }
+
+            exit 1
+          }
+
+          Write-Host "Using bridge output:"
+          Write-Host $bridgeOut.FullName
+
+          New-Item `
+            -ItemType Directory `
+            -Path $bridgePackage `
+            -Force |
+            Out-Null
+
+          Copy-Item `
+            "$($bridgeOut.FullName)\*" `
+            "$bridgePackage\" `
+            -Recurse `
+            -Force
+
+          # Launcher
+          Copy-Item `
+            "$env:GITHUB_WORKSPACE\Launch-XboxVR.ps1" `
+            "$packageRoot\Launch-XboxVR.ps1" `
+            -Force
+
+          # HIDMaestro setup helper
+          Copy-Item `
+            "$bridgeRoot\setup_hidmaestro.ps1" `
+            "$bridgePackage\setup_hidmaestro.ps1" `
+            -Force
+
+          # Validate bridge package
+          if (!(Test-Path "$bridgePackage\XboxVR-HIDMaestroBridge.exe")) {
+            Write-Error "Bridge executable missing."
+            Write-Host "Bridge package contents:"
+            Get-ChildItem $bridgePackage -Recurse
+            exit 1
+          }
+
+          if (!(Test-Path "$bridgePackage\HIDMaestro.Core.dll")) {
+            Write-Error "HIDMaestro.Core.dll missing."
+            Write-Host "Bridge package contents:"
+            Get-ChildItem $bridgePackage -Recurse
+            exit 1
+          }
+
           Write-Host "HIDMaestro bridge package validated."
 
       - name: Validate driver package
@@ -138,6 +213,7 @@ jobs:
         shell: pwsh
         run: |
           $root = "$env:GITHUB_WORKSPACE\XboxVR-Driver\driver\openvr-emulator"
+
           $required = @(
             "$root\driver.vrdrivermanifest",
             "$root\bin\win64\driver_openvr-emulator.dll",
@@ -149,9 +225,15 @@ jobs:
           )
 
           $failed = $false
+
           foreach ($file in $required) {
-            if (Test-Path $file) { Write-Host "[OK] $file" }
-            else { Write-Host "[MISSING] $file"; $failed = $true }
+            if (Test-Path $file) {
+              Write-Host "[OK] $file"
+            }
+            else {
+              Write-Host "[MISSING] $file"
+              $failed = $true
+            }
           }
 
           if ($failed) {
@@ -166,7 +248,10 @@ jobs:
         shell: pwsh
         run: |
           $zip = "$env:GITHUB_WORKSPACE\XboxVR-Driver-${{ github.sha }}.zip"
-          if (Test-Path $zip) { Remove-Item $zip -Force }
+
+          if (Test-Path $zip) {
+            Remove-Item $zip -Force
+          }
 
           Compress-Archive `
             -Path "$env:GITHUB_WORKSPACE\XboxVR-Driver\*" `
@@ -184,4 +269,3 @@ jobs:
           path: XboxVR-Driver-${{ github.sha }}.zip
           if-no-files-found: error
           retention-days: 30
-
