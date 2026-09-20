@@ -34,12 +34,22 @@ jobs:
 
       - name: Set up Ninja
         shell: pwsh
-        run: python -m pip install --upgrade "ninja>=1,<2"
+        run: |
+          python -m pip install --upgrade "ninja>=1,<2"
 
       - name: Set up .NET 10
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '10.x'
+          dotnet-version: "10.x"
+
+      - name: Show tool versions
+        shell: pwsh
+        run: |
+          Write-Host "=== Tool versions ==="
+          cmake --version
+          ninja --version
+          dotnet --info
+          Write-Host "====================="
 
       - name: Install OpenVR SDK
         shell: pwsh
@@ -74,49 +84,162 @@ jobs:
 
           if (!(Test-Path $dll)) {
             Write-Error "Release driver DLL not found: $dll"
-            Write-Host "Searching build directory..."
-            Get-ChildItem build -Recurse -Filter "*.dll"
+
+            Write-Host ""
+            Write-Host "Searching build directory for DLL files..."
+            Get-ChildItem build -Recurse -Filter "*.dll" |
+              ForEach-Object {
+                Write-Host $_.FullName
+              }
+
             exit 1
           }
 
           Write-Host "Release DLL found: $dll"
           Get-FileHash $dll -Algorithm SHA256
-          "DRIVER_DLL=$dll" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Setup and build HIDMaestro bridge
+          "DRIVER_DLL=$dll" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # ================================================================
+      # HIDMAESTRO BRIDGE
+      # ================================================================
+
+      - name: Setup HIDMaestro dependency
         if: matrix.config == 'Release'
         shell: pwsh
         run: |
           $bridgeRoot = "$env:GITHUB_WORKSPACE\tools\XboxVR-HIDMaestroBridge"
 
-          & "$bridgeRoot\setup_hidmaestro.ps1" -SkipBuild
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "Bridge root:"
+          Write-Host $bridgeRoot
 
-          dotnet publish "$bridgeRoot\XboxVR-HIDMaestroBridge.csproj" `
-            --configuration Release `
-            --runtime win-x64 `
-            --self-contained false `
-            --output "$bridgeRoot\publish"
+          if (!(Test-Path "$bridgeRoot\XboxVR-HIDMaestroBridge.csproj")) {
+            Write-Error "Bridge project not found."
+            exit 1
+          }
+
+          if (!(Test-Path "$bridgeRoot\setup_hidmaestro.ps1")) {
+            Write-Error "setup_hidmaestro.ps1 not found."
+            exit 1
+          }
+
+          # Download/extract HIDMaestro.Core.dll.
+          # Do not build here; the workflow will explicitly restore/publish.
+          & "$bridgeRoot\setup_hidmaestro.ps1" -SkipBuild
 
           if ($LASTEXITCODE -ne 0) {
+            Write-Error "HIDMaestro dependency setup failed."
             exit $LASTEXITCODE
           }
 
-          if (!(Test-Path "$bridgeRoot\publish\XboxVR-HIDMaestroBridge.exe")) {
-            Write-Error "HIDMaestro bridge executable was not produced."
-            Get-ChildItem "$bridgeRoot" -Recurse | Select-Object FullName
+          $core = "$bridgeRoot\HIDMaestro\HIDMaestro.Core.dll"
+
+          if (!(Test-Path $core)) {
+            Write-Error "HIDMaestro.Core.dll was not downloaded to:"
+            Write-Host $core
             exit 1
           }
 
-          if (!(Test-Path "$bridgeRoot\publish\HIDMaestro.Core.dll")) {
-            Write-Error "HIDMaestro.Core.dll was not produced/copied."
-            Get-ChildItem "$bridgeRoot" -Recurse | Select-Object FullName
+          Write-Host "HIDMaestro.Core.dll found:"
+          Write-Host $core
+
+          Get-FileHash $core -Algorithm SHA256
+
+      - name: Restore HIDMaestro bridge
+        if: matrix.config == 'Release'
+        shell: pwsh
+        run: |
+          $bridgeRoot = "$env:GITHUB_WORKSPACE\tools\XboxVR-HIDMaestroBridge"
+          $project = "$bridgeRoot\XboxVR-HIDMaestroBridge.csproj"
+
+          Write-Host "Restoring:"
+          Write-Host $project
+
+          dotnet restore $project
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "HIDMaestro bridge restore failed."
+            exit $LASTEXITCODE
+          }
+
+          Write-Host "HIDMaestro bridge restore succeeded."
+
+      - name: Publish HIDMaestro bridge
+        if: matrix.config == 'Release'
+        shell: pwsh
+        run: |
+          $bridgeRoot = "$env:GITHUB_WORKSPACE\tools\XboxVR-HIDMaestroBridge"
+          $project = "$bridgeRoot\XboxVR-HIDMaestroBridge.csproj"
+          $bridgeOut = "$bridgeRoot\publish"
+
+          Write-Host "Project:"
+          Write-Host $project
+
+          Write-Host "Publish directory:"
+          Write-Host $bridgeOut
+
+          # Always start from a clean output directory.
+          if (Test-Path $bridgeOut) {
+            Remove-Item $bridgeOut -Recurse -Force
+          }
+
+          New-Item `
+            -ItemType Directory `
+            -Path $bridgeOut `
+            -Force |
+            Out-Null
+
+          dotnet publish `
+            $project `
+            --configuration Release `
+            --runtime win-x64 `
+            --self-contained false `
+            --output $bridgeOut `
+            --no-restore
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "HIDMaestro bridge publish failed."
+
+            Write-Host ""
+            Write-Host "Bridge project contents:"
+            Get-ChildItem $bridgeRoot -Recurse |
+              Select-Object FullName
+
+            exit $LASTEXITCODE
+          }
+
+          Write-Host ""
+          Write-Host "=== HIDMaestro publish output ==="
+
+          Get-ChildItem $bridgeOut -Recurse -File |
+            ForEach-Object {
+              Write-Host $_.FullName
+            }
+
+          Write-Host "================================="
+
+          $exe = "$bridgeOut\XboxVR-HIDMaestroBridge.exe"
+          $core = "$bridgeOut\HIDMaestro.Core.dll"
+
+          if (!(Test-Path $exe)) {
+            Write-Error "XboxVR-HIDMaestroBridge.exe was not produced."
             exit 1
           }
 
+          if (!(Test-Path $core)) {
+            Write-Error "HIDMaestro.Core.dll was not copied to publish output."
+            exit 1
+          }
+
+          Write-Host ""
           Write-Host "HIDMaestro bridge publish succeeded."
-          Get-ChildItem "$bridgeRoot\publish" -File |
-            ForEach-Object { Write-Host $_.FullName }
+          Write-Host "EXE: $exe"
+          Write-Host "DLL: $core"
+
+      # ================================================================
+      # PACKAGE COMPLETE STEAMVR DRIVER
+      # ================================================================
 
       - name: Prepare complete SteamVR driver
         if: matrix.config == 'Release'
@@ -140,26 +263,41 @@ jobs:
             Remove-Item $packageRoot -Recurse -Force
           }
 
-          New-Item -ItemType Directory -Path $package -Force | Out-Null
-          Copy-Item "$source\*" "$package\" -Recurse -Force
+          New-Item `
+            -ItemType Directory `
+            -Path $package `
+            -Force |
+            Out-Null
+
+          Copy-Item `
+            "$source\*" `
+            "$package\" `
+            -Recurse `
+            -Force
 
           $destinationBin = "$package\bin\win64"
-          New-Item -ItemType Directory -Path $destinationBin -Force | Out-Null
+
+          New-Item `
+            -ItemType Directory `
+            -Path $destinationBin `
+            -Force |
+            Out-Null
 
           Copy-Item `
             "$env:DRIVER_DLL" `
             "$destinationBin\driver_openvr-emulator.dll" `
             -Force
 
-          Write-Host "Complete SteamVR driver package:"
+          Write-Host ""
+          Write-Host "=== Complete SteamVR driver package ==="
+
           Get-ChildItem $packageRoot -Recurse -File |
-            ForEach-Object { Write-Host $_.FullName }
+            ForEach-Object {
+              Write-Host $_.FullName
+            }
 
           # ------------------------------------------------------------
           # HIDMaestro bridge
-          # The bridge build step publishes directly to:
-          #
-          # tools\XboxVR-HIDMaestroBridge\publish
           # ------------------------------------------------------------
 
           $bridgeRoot = "$env:GITHUB_WORKSPACE\tools\XboxVR-HIDMaestroBridge"
@@ -167,26 +305,21 @@ jobs:
           $bridgePackage = "$packageRoot\XboxVR-HIDMaestroBridge"
 
           Write-Host ""
-          Write-Host "Checking HIDMaestro bridge output..."
-          Write-Host "Expected: $bridgeOut"
+          Write-Host "=== HIDMaestro bridge packaging ==="
+          Write-Host "Source: $bridgeOut"
+          Write-Host "Destination: $bridgePackage"
 
           if (!(Test-Path $bridgeOut)) {
-            Write-Error "HIDMaestro bridge publish directory not found: $bridgeOut"
+            Write-Error "HIDMaestro bridge publish directory not found:"
+            Write-Host $bridgeOut
 
             Write-Host ""
-            Write-Host "Bridge directory contents:"
-            if (Test-Path $bridgeRoot) {
-              Get-ChildItem $bridgeRoot -Recurse |
-                Select-Object FullName
-            }
-            else {
-              Write-Host "Bridge root does not exist."
-            }
+            Write-Host "Bridge root contents:"
+            Get-ChildItem $bridgeRoot -Recurse |
+              Select-Object FullName
 
             exit 1
           }
-
-          Write-Host "HIDMaestro bridge output found."
 
           New-Item `
             -ItemType Directory `
@@ -201,37 +334,64 @@ jobs:
             -Force
 
           # Launcher
+          $launcher = "$env:GITHUB_WORKSPACE\Launch-XboxVR.ps1"
+
+          if (!(Test-Path $launcher)) {
+            Write-Error "Launch-XboxVR.ps1 not found."
+            exit 1
+          }
+
           Copy-Item `
-            "$env:GITHUB_WORKSPACE\Launch-XboxVR.ps1" `
+            $launcher `
             "$packageRoot\Launch-XboxVR.ps1" `
             -Force
 
           # HIDMaestro setup helper
+          $setupScript = "$bridgeRoot\setup_hidmaestro.ps1"
+
+          if (!(Test-Path $setupScript)) {
+            Write-Error "setup_hidmaestro.ps1 not found."
+            exit 1
+          }
+
           Copy-Item `
-            "$bridgeRoot\setup_hidmaestro.ps1" `
+            $setupScript `
             "$bridgePackage\setup_hidmaestro.ps1" `
             -Force
 
-          # Validate bridge package
-          if (!(Test-Path "$bridgePackage\XboxVR-HIDMaestroBridge.exe")) {
-            Write-Error "Bridge executable missing."
+          # Validate bridge
+          $bridgeExe = "$bridgePackage\XboxVR-HIDMaestroBridge.exe"
+          $bridgeCore = "$bridgePackage\HIDMaestro.Core.dll"
+
+          if (!(Test-Path $bridgeExe)) {
+            Write-Error "Bridge executable missing:"
+            Write-Host $bridgeExe
+
             Get-ChildItem $bridgePackage -Recurse
             exit 1
           }
 
-          if (!(Test-Path "$bridgePackage\HIDMaestro.Core.dll")) {
-            Write-Error "HIDMaestro.Core.dll missing."
+          if (!(Test-Path $bridgeCore)) {
+            Write-Error "HIDMaestro.Core.dll missing:"
+            Write-Host $bridgeCore
+
             Get-ChildItem $bridgePackage -Recurse
             exit 1
           }
 
+          Write-Host ""
           Write-Host "HIDMaestro bridge package validated."
+
+      # ================================================================
+      # VALIDATE COMPLETE PACKAGE
+      # ================================================================
 
       - name: Validate driver package
         if: matrix.config == 'Release'
         shell: pwsh
         run: |
           $root = "$env:GITHUB_WORKSPACE\XboxVR-Driver\driver\openvr-emulator"
+          $bridge = "$env:GITHUB_WORKSPACE\XboxVR-Driver\XboxVR-HIDMaestroBridge"
 
           $required = @(
             "$root\driver.vrdrivermanifest",
@@ -240,7 +400,11 @@ jobs:
             "$root\resources\localization\localization.json",
             "$root\resources\input\openvr-emulator_controller_bindings.json",
             "$root\resources\input\openvr-emulator_controller_left.svg",
-            "$root\resources\input\openvr-emulator_controller_right.svg"
+            "$root\resources\input\openvr-emulator_controller_right.svg",
+            "$bridge\XboxVR-HIDMaestroBridge.exe",
+            "$bridge\HIDMaestro.Core.dll",
+            "$bridge\setup_hidmaestro.ps1",
+            "$env:GITHUB_WORKSPACE\XboxVR-Driver\Launch-XboxVR.ps1"
           )
 
           $failed = $false
@@ -256,11 +420,16 @@ jobs:
           }
 
           if ($failed) {
-            Write-Error "SteamVR driver package validation failed."
+            Write-Error "Complete XboxVR package validation failed."
             exit 1
           }
 
-          Write-Host "SteamVR driver package validation PASSED."
+          Write-Host ""
+          Write-Host "Complete XboxVR package validation PASSED."
+
+      # ================================================================
+      # ZIP
+      # ================================================================
 
       - name: Create complete driver ZIP
         if: matrix.config == 'Release'
@@ -278,7 +447,10 @@ jobs:
             -CompressionLevel Optimal
 
           Get-FileHash $zip -Algorithm SHA256
-          Write-Host "Created: $zip"
+
+          Write-Host ""
+          Write-Host "Created:"
+          Write-Host $zip
 
       - name: Upload complete SteamVR driver
         if: matrix.config == 'Release'
