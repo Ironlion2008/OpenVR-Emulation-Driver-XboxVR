@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PlatformTarget>x64</PlatformTarget>
+    <AssemblyName>XboxVR-HIDMaestroBridge</AssemblyName>
+    <RootNamespace>XboxVR.HIDMaestroBridge</RootNamespace>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="HIDMaestro\HIDMaestro.Core.dll" CopyToOutputDirectory="PreserveNewest" Link="HIDMaestro.Core.dll" />
+  </ItemGroup>
+  <PropertyGroup>
+  </PropertyGroup>
+</Project>

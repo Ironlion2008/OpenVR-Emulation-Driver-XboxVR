@@ -1,0 +1,187 @@
+name: Build XboxVR Driver
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    name: Windows MSVC ${{ matrix.config }}
+    runs-on: windows-2022
+
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [Debug, Release]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Set up Ninja
+        shell: pwsh
+        run: python -m pip install --upgrade "ninja>=1,<2"
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.x'
+
+      - name: Install OpenVR SDK
+        shell: pwsh
+        run: |
+          .\scripts\fetch_openvr.ps1 `
+            -Destination "$env:GITHUB_WORKSPACE\openvr-sdk"
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S . -B build `
+            -G "Ninja Multi-Config" `
+            -DOPENVR_ROOT="$env:GITHUB_WORKSPACE\openvr-sdk" `
+            -DOPENVR_LIB="$env:GITHUB_WORKSPACE\openvr-sdk\lib\win64\openvr_api.lib" `
+            -DBUILD_PREVIEW_APP=OFF `
+            -DBUILD_TESTING=OFF `
+            -DOPENVR_EMULATOR_SKIP_DEPLOY=ON
+
+      - name: Build driver
+        shell: pwsh
+        run: |
+          cmake --build build `
+            --config ${{ matrix.config }} `
+            --target driver_openvr-emulator `
+            --parallel
+
+      - name: Verify Release outputs
+        if: matrix.config == 'Release'
+        shell: pwsh
+        run: |
+          $dll = "build\Release\openvr-emulator\bin\win64\driver_openvr-emulator.dll"
+
+          if (!(Test-Path $dll)) {
+            Write-Error "Release driver DLL not found: $dll"
+            Write-Host "Searching build directory..."
+            Get-ChildItem build -Recurse -Filter "*.dll"
+            exit 1
+          }
+
+          Write-Host "Release DLL found: $dll"
+          Get-FileHash $dll -Algorithm SHA256
+          "DRIVER_DLL=$dll" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Setup and build HIDMaestro bridge
+        if: matrix.config == 'Release'
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE\tools\XboxVR-HIDMaestroBridge\setup_hidmaestro.ps1"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Prepare complete SteamVR driver
+        if: matrix.config == 'Release'
+        shell: pwsh
+        run: |
+          $source = "$env:GITHUB_WORKSPACE\driver_files\driver\openvr-emulator"
+          $packageRoot = "$env:GITHUB_WORKSPACE\XboxVR-Driver"
+          $package = "$packageRoot\driver\openvr-emulator"
+
+          if (!(Test-Path "$source\driver.vrdrivermanifest")) {
+            Write-Error "driver.vrdrivermanifest not found at $source"
+            exit 1
+          }
+          if (!(Test-Path "$source\resources")) {
+            Write-Error "Driver resources directory not found at $source"
+            exit 1
+          }
+
+          if (Test-Path $packageRoot) {
+            Remove-Item $packageRoot -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Path $package -Force | Out-Null
+          Copy-Item "$source\*" "$package\" -Recurse -Force
+
+          $destinationBin = "$package\bin\win64"
+          New-Item -ItemType Directory -Path $destinationBin -Force | Out-Null
+          Copy-Item "$env:DRIVER_DLL" "$destinationBin\driver_openvr-emulator.dll" -Force
+
+          Write-Host "Complete SteamVR driver package:"
+          Get-ChildItem $packageRoot -Recurse -File | ForEach-Object { Write-Host $_.FullName }
+
+          # Package the HIDMaestro consumer bridge beside the HMD driver.
+          $bridgeOut = "$env:GITHUB_WORKSPACE\tools\XboxVR-HIDMaestroBridge\bin\Release\net10.0-windows10.0.19041.0\win-x64"
+          $bridgePackage = "$packageRoot\XboxVR-HIDMaestroBridge"
+          New-Item -ItemType Directory -Path $bridgePackage -Force | Out-Null
+          Copy-Item "$bridgeOut\*" "$bridgePackage\" -Recurse -Force
+          Copy-Item "$env:GITHUB_WORKSPACE\Launch-XboxVR.ps1" "$packageRoot\Launch-XboxVR.ps1" -Force
+          Copy-Item "$env:GITHUB_WORKSPACE\tools\XboxVR-HIDMaestroBridge\setup_hidmaestro.ps1" "$bridgePackage\setup_hidmaestro.ps1" -Force
+
+          if (!(Test-Path "$bridgePackage\XboxVR-HIDMaestroBridge.exe")) { throw "Bridge executable missing." }
+          if (!(Test-Path "$bridgePackage\HIDMaestro.Core.dll")) { throw "HIDMaestro.Core.dll missing." }
+          Write-Host "HIDMaestro bridge package validated."
+
+      - name: Validate driver package
+        if: matrix.config == 'Release'
+        shell: pwsh
+        run: |
+          $root = "$env:GITHUB_WORKSPACE\XboxVR-Driver\driver\openvr-emulator"
+          $required = @(
+            "$root\driver.vrdrivermanifest",
+            "$root\bin\win64\driver_openvr-emulator.dll",
+            "$root\resources\input_mapping.ini",
+            "$root\resources\localization\localization.json",
+            "$root\resources\input\openvr-emulator_controller_bindings.json",
+            "$root\resources\input\openvr-emulator_controller_left.svg",
+            "$root\resources\input\openvr-emulator_controller_right.svg"
+          )
+
+          $failed = $false
+          foreach ($file in $required) {
+            if (Test-Path $file) { Write-Host "[OK] $file" }
+            else { Write-Host "[MISSING] $file"; $failed = $true }
+          }
+
+          if ($failed) {
+            Write-Error "SteamVR driver package validation failed."
+            exit 1
+          }
+
+          Write-Host "SteamVR driver package validation PASSED."
+
+      - name: Create complete driver ZIP
+        if: matrix.config == 'Release'
+        shell: pwsh
+        run: |
+          $zip = "$env:GITHUB_WORKSPACE\XboxVR-Driver-${{ github.sha }}.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+
+          Compress-Archive `
+            -Path "$env:GITHUB_WORKSPACE\XboxVR-Driver\*" `
+            -DestinationPath $zip `
+            -CompressionLevel Optimal
+
+          Get-FileHash $zip -Algorithm SHA256
+          Write-Host "Created: $zip"
+
+      - name: Upload complete SteamVR driver
+        if: matrix.config == 'Release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: XboxVR-Driver-${{ github.sha }}
+          path: XboxVR-Driver-${{ github.sha }}.zip
+          if-no-files-found: error
+          retention-days: 30
+

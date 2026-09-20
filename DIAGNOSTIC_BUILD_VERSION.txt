@@ -1,0 +1,2 @@
+XboxVR Diagnostic Build v1.0.3
+Fix: resource root path now resolves DLL -> driver root correctly.
