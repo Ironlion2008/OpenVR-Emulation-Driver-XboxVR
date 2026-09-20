@@ -156,44 +156,37 @@ jobs:
             ForEach-Object { Write-Host $_.FullName }
 
           # ------------------------------------------------------------
-          # Package HIDMaestro consumer bridge.
-          # Find the actual win-x64 output directory instead of assuming
-          # a specific .NET target-framework path.
+          # HIDMaestro bridge
+          # The bridge build step publishes directly to:
+          #
+          # tools\XboxVR-HIDMaestroBridge\publish
           # ------------------------------------------------------------
 
           $bridgeRoot = "$env:GITHUB_WORKSPACE\tools\XboxVR-HIDMaestroBridge"
+          $bridgeOut = "$bridgeRoot\publish"
           $bridgePackage = "$packageRoot\XboxVR-HIDMaestroBridge"
 
           Write-Host ""
-          Write-Host "Searching for HIDMaestro bridge output..."
+          Write-Host "Checking HIDMaestro bridge output..."
+          Write-Host "Expected: $bridgeOut"
 
-          $bridgeOut = Get-ChildItem `
-            "$bridgeRoot\bin\Release" `
-            -Directory `
-            -Recurse |
-            Where-Object {
-              $_.Name -eq "win-x64"
-            } |
-            Select-Object -First 1
-
-          if (-not $bridgeOut) {
-            Write-Error "XboxVR-HIDMaestroBridge win-x64 output directory was not found."
+          if (!(Test-Path $bridgeOut)) {
+            Write-Error "HIDMaestro bridge publish directory not found: $bridgeOut"
 
             Write-Host ""
-            Write-Host "Contents of bridge bin directory:"
-            if (Test-Path "$bridgeRoot\bin") {
-              Get-ChildItem "$bridgeRoot\bin" -Recurse |
+            Write-Host "Bridge directory contents:"
+            if (Test-Path $bridgeRoot) {
+              Get-ChildItem $bridgeRoot -Recurse |
                 Select-Object FullName
             }
             else {
-              Write-Host "Bridge bin directory does not exist."
+              Write-Host "Bridge root does not exist."
             }
 
             exit 1
           }
 
-          Write-Host "Using bridge output:"
-          Write-Host $bridgeOut.FullName
+          Write-Host "HIDMaestro bridge output found."
 
           New-Item `
             -ItemType Directory `
@@ -202,7 +195,7 @@ jobs:
             Out-Null
 
           Copy-Item `
-            "$($bridgeOut.FullName)\*" `
+            "$bridgeOut\*" `
             "$bridgePackage\" `
             -Recurse `
             -Force
@@ -222,14 +215,12 @@ jobs:
           # Validate bridge package
           if (!(Test-Path "$bridgePackage\XboxVR-HIDMaestroBridge.exe")) {
             Write-Error "Bridge executable missing."
-            Write-Host "Bridge package contents:"
             Get-ChildItem $bridgePackage -Recurse
             exit 1
           }
 
           if (!(Test-Path "$bridgePackage\HIDMaestro.Core.dll")) {
             Write-Error "HIDMaestro.Core.dll missing."
-            Write-Host "Bridge package contents:"
             Get-ChildItem $bridgePackage -Recurse
             exit 1
           }
