@@ -124,20 +124,36 @@ jobs:
             exit 1
           }
 
-          # Download/extract HIDMaestro.Core.dll.
-          # Do not build here; the workflow will explicitly restore/publish.
+          # The setup script downloads HIDMaestro.Core.dll.
+          # It may return a non-zero code because its normal local-use
+          # instructions expect the bridge to be run as Administrator.
           & "$bridgeRoot\setup_hidmaestro.ps1" -SkipBuild
 
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "HIDMaestro dependency setup failed."
-            exit $LASTEXITCODE
-          }
+          Write-Host ""
+          Write-Host "HIDMaestro setup script completed."
 
-          $core = "$bridgeRoot\HIDMaestro\HIDMaestro.Core.dll"
+          # Do NOT use $LASTEXITCODE here.
+          # CI only needs the downloaded dependency; SteamVR driver
+          # registration is a runtime/local-machine operation.
 
-          if (!(Test-Path $core)) {
-            Write-Error "HIDMaestro.Core.dll was not downloaded to:"
-            Write-Host $core
+          $coreCandidates = @(
+            "$bridgeRoot\HIDMaestro.Core.dll",
+            "$bridgeRoot\HIDMaestro\HIDMaestro.Core.dll",
+            "$bridgeRoot\bin\HIDMaestro.Core.dll"
+          )
+
+          $core = $coreCandidates |
+            Where-Object { Test-Path $_ } |
+            Select-Object -First 1
+
+          if (!$core) {
+            Write-Error "HIDMaestro.Core.dll was not found after setup."
+
+            Write-Host ""
+            Write-Host "Bridge directory contents:"
+            Get-ChildItem $bridgeRoot -Recurse |
+              Select-Object FullName
+
             exit 1
           }
 
